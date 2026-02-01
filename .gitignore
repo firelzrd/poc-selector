@@ -1,0 +1,14 @@
+# Build artifacts
+benchmark/poc_bench
+*.o
+*.d
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
