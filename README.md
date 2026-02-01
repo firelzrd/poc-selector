@@ -45,6 +45,8 @@ When the fast path cannot handle the request (LLC > 64 CPUs, restricted affinity
 
 Measured with the included `poc_bench` tool on a partially saturated system (half of CPUs running background load), which represents the scenario where linear scanning is most expensive.
 
+Ryzen 7 7840HS (8C/16T):
+
 |               | POC ON       | POC OFF      |           |
 |---------------|-------------:|-------------:|-----------|
 | **mean**      |   9,842.3 ns |  31,025.7 ns |           |
