@@ -3,6 +3,8 @@
 A kernel patch that accelerates idle CPU discovery using per-LLC atomic bitmasks,
 achieving O(1) lookup instead of linear scanning.
 
+<div align="center"><img width="256" height="224" alt="poc" src="https://github.com/user-attachments/assets/c9452565-3498-430b-9d87-706662956968" /></div>
+
 ## Inspiration
 
 This project was born from the ideas pioneered by
@@ -94,10 +96,10 @@ Options:
 
 The benchmark requires root to toggle `/proc/sys/kernel/sched_poc_selector`.
 
-## License
-
-GPL-2.0 — see [LICENSE](LICENSE).
-
 ## Special Thanks
 
 RitzDaCat - of course, for giving birth to scx_cake inspiring me of implementing the selector.
+
+## License
+
+GPL-2.0 — see [LICENSE](LICENSE).
