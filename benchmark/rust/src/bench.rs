@@ -1,8 +1,8 @@
+use crate::system::BenchParams;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
-use crate::system::BenchParams;
 
 // ---------------------------------------------------------------------------
 // Shadow thread context
@@ -68,7 +68,9 @@ fn worker_thread(ctx: &WorkerCtx) {
     // Initial shadow setup
     let cpu = sched_getcpu();
     ctx.shadows[0].ack.store(0, Ordering::Release);
-    ctx.shadows[0].target_cpu.store(cpu as i32, Ordering::Release);
+    ctx.shadows[0]
+        .target_cpu
+        .store(cpu as i32, Ordering::Release);
     bounded_spin_wait(&ctx.shadows[0].ack);
     ctx.sync_done.fetch_add(1, Ordering::Release);
 
@@ -96,7 +98,9 @@ fn worker_thread(ctx: &WorkerCtx) {
         // Tell shadow to pin to our current CPU
         let cpu = sched_getcpu();
         ctx.shadows[sidx].ack.store(0, Ordering::Release);
-        ctx.shadows[sidx].target_cpu.store(cpu as i32, Ordering::Release);
+        ctx.shadows[sidx]
+            .target_cpu
+            .store(cpu as i32, Ordering::Release);
         bounded_spin_wait(&ctx.shadows[sidx].ack);
 
         if n_shadows > 1 {
@@ -135,11 +139,7 @@ impl BenchHandle {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn bench_burst_async(
-    params: &BenchParams,
-    iterations: usize,
-    warmup: usize,
-) -> BenchHandle {
+pub fn bench_burst_async(params: &BenchParams, iterations: usize, warmup: usize) -> BenchHandle {
     let progress = Arc::new(AtomicU32::new(0));
     let (tx, rx) = mpsc::channel();
     let total_iters = (warmup + iterations) as u32;
@@ -152,14 +152,14 @@ pub fn bench_burst_async(
         let _ = tx.send(result);
     });
 
-    BenchHandle { progress, total: total_iters, rx }
+    BenchHandle {
+        progress,
+        total: total_iters,
+        rx,
+    }
 }
 
-pub fn bench_burst_sync(
-    params: &BenchParams,
-    iterations: usize,
-    warmup: usize,
-) -> Vec<u64> {
+pub fn bench_burst_sync(params: &BenchParams, iterations: usize, warmup: usize) -> Vec<u64> {
     let progress = Arc::new(AtomicU32::new(0));
     bench_burst_inner(params, iterations, warmup, &progress)
 }
@@ -315,7 +315,9 @@ fn bench_burst_inner(
 
     // Close eventfds
     for &efd in &worker_efds {
-        unsafe { libc::close(efd); }
+        unsafe {
+            libc::close(efd);
+        }
     }
 
     // Restore scheduler policy and affinity
@@ -334,8 +336,13 @@ fn bench_burst_inner(
 // ---------------------------------------------------------------------------
 
 fn now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -384,9 +391,7 @@ fn set_fifo_self() -> Option<SavedSchedPolicy> {
         }
         libc::sched_getparam(0, &mut orig_param);
 
-        let fifo_param = libc::sched_param {
-            sched_priority: 1,
-        };
+        let fifo_param = libc::sched_param { sched_priority: 1 };
         if libc::sched_setscheduler(0, libc::SCHED_FIFO, &fifo_param) == 0 {
             Some(SavedSchedPolicy {
                 policy: orig_policy,

@@ -74,8 +74,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),  // header
-            Constraint::Length(3),  // progress
+            Constraint::Length(4), // header
+            Constraint::Length(3), // progress
             Constraint::Min(12),   // histogram
             Constraint::Length(8), // summary
             Constraint::Length(1), // footer
@@ -95,7 +95,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(
                 &app.system.cpu_model,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" \u{2502} {} CPUs", app.system.ncpus),
@@ -137,7 +139,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::default()
         .title(" POC Selector Benchmark ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT);
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
@@ -147,7 +153,11 @@ fn draw_progress(f: &mut Frame, area: Rect, app: &App) {
     let label = match &app.phase {
         Phase::Calibrating => "Calibrating...".to_string(),
         Phase::Discard => "Warmup (discard)...".to_string(),
-        Phase::Running { round, total_rounds, poc_on } => {
+        Phase::Running {
+            round,
+            total_rounds,
+            poc_on,
+        } => {
             let mode = if *poc_on { "POC ON" } else { "CFS" };
             format!("Round {}/{} [{}]", round, total_rounds, mode)
         }
@@ -211,8 +221,16 @@ fn draw_histogram(f: &mut Frame, area: Rect, app: &App) {
             break;
         }
         let bar_w = half_w.saturating_sub(1);
-        let on_frac = app.hist_on.as_ref().map(|h| h.fraction(bucket)).unwrap_or(0.0);
-        let off_frac = app.hist_off.as_ref().map(|h| h.fraction(bucket)).unwrap_or(0.0);
+        let on_frac = app
+            .hist_on
+            .as_ref()
+            .map(|h| h.fraction(bucket))
+            .unwrap_or(0.0);
+        let off_frac = app
+            .hist_off
+            .as_ref()
+            .map(|h| h.fraction(bucket))
+            .unwrap_or(0.0);
 
         let on_bar = render_bar(on_frac, max_frac, bar_w, COL_POC);
         let off_bar = render_bar(off_frac, max_frac, bar_w, COL_CFS);
@@ -260,14 +278,30 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("{:>12}", ""), Style::default()),
-        Span::styled(format!("{:>14}", "POC ON"), Style::default().fg(COL_POC).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:>14}", "CFS"), Style::default().fg(COL_CFS).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:>12}", "\u{0394}"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:>14}", "POC ON"),
+            Style::default().fg(COL_POC).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>14}", "CFS"),
+            Style::default().fg(COL_CFS).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>12}", "\u{0394}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
     ])];
 
     let rows: Vec<(&str, f64, f64, bool)> = vec![
         ("mean", on.mean / 1000.0, off.mean / 1000.0, true),
-        ("trimmed", on.trimmed_mean / 1000.0, off.trimmed_mean / 1000.0, true),
+        (
+            "trimmed",
+            on.trimmed_mean / 1000.0,
+            off.trimmed_mean / 1000.0,
+            true,
+        ),
         ("p50", on.p50 as f64 / 1000.0, off.p50 as f64 / 1000.0, true),
         ("p99", on.p99 as f64 / 1000.0, off.p99 as f64 / 1000.0, true),
         ("ops/sec", on.ops_per_sec(), off.ops_per_sec(), false),
@@ -280,14 +314,21 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App) {
             0.0
         };
 
-        let is_better = if lower_is_better { delta < 0.0 } else { delta > 0.0 };
+        let is_better = if lower_is_better {
+            delta < 0.0
+        } else {
+            delta > 0.0
+        };
         let delta_color = if is_better { COL_BETTER } else { COL_WORSE };
         let arrow = if delta < 0.0 { "\u{25bc}" } else { "\u{25b2}" };
 
         let (on_str, off_str) = if label == "ops/sec" {
             (format_int(v_on), format_int(v_off))
         } else {
-            (format!("{:.2} \u{03bc}s", v_on), format!("{:.2} \u{03bc}s", v_off))
+            (
+                format!("{:.2} \u{03bc}s", v_on),
+                format!("{:.2} \u{03bc}s", v_off),
+            )
         };
 
         lines.push(Line::from(vec![
@@ -296,7 +337,9 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!("{:>14}", off_str), Style::default().fg(COL_CFS)),
             Span::styled(
                 format!("{:>+8.1}% {}", delta, arrow),
-                Style::default().fg(delta_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(delta_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -311,11 +354,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "Press q to abort"
     };
-    let p = Paragraph::new(Line::from(Span::styled(
-        text,
-        Style::default().fg(COL_DIM),
-    )))
-    .alignment(ratatui::layout::Alignment::Center);
+    let p = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(COL_DIM))))
+        .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(p, area);
 }
 
@@ -346,29 +386,14 @@ fn render_bar(frac: f64, max_frac: f64, width: usize, color: Color) -> Vec<Span<
         let before = filled - pct.len() - 1;
         let after = empty;
         vec![
-            Span::styled(
-                "\u{2588}".repeat(before + 1),
-                Style::default().fg(color),
-            ),
-            Span::styled(
-                pct,
-                Style::default().fg(Color::Black).bg(color),
-            ),
-            Span::styled(
-                " ".repeat(after),
-                Style::default().fg(COL_DIM),
-            ),
+            Span::styled("\u{2588}".repeat(before + 1), Style::default().fg(color)),
+            Span::styled(pct, Style::default().fg(Color::Black).bg(color)),
+            Span::styled(" ".repeat(after), Style::default().fg(COL_DIM)),
         ]
     } else {
         vec![
-            Span::styled(
-                "\u{2588}".repeat(filled),
-                Style::default().fg(color),
-            ),
-            Span::styled(
-                " ".repeat(empty),
-                Style::default().fg(COL_DIM),
-            ),
+            Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
+            Span::styled(" ".repeat(empty), Style::default().fg(COL_DIM)),
         ]
     }
 }
@@ -391,13 +416,23 @@ fn center_pad(s: &str, width: usize) -> String {
         return s[..width].to_string();
     }
     let pad = (width - s.len()) / 2;
-    format!("{}{}{}", " ".repeat(pad), s, " ".repeat(width - pad - s.len()))
+    format!(
+        "{}{}{}",
+        " ".repeat(pad),
+        s,
+        " ".repeat(width - pad - s.len())
+    )
 }
 
 fn format_int(v: f64) -> String {
     let v = v as u64;
     if v >= 1_000_000 {
-        format!("{},{:03},{:03}", v / 1_000_000, (v / 1_000) % 1_000, v % 1_000)
+        format!(
+            "{},{:03},{:03}",
+            v / 1_000_000,
+            (v / 1_000) % 1_000,
+            v % 1_000
+        )
     } else if v >= 1_000 {
         format!("{},{:03}", v / 1_000, v % 1_000)
     } else {
@@ -414,7 +449,10 @@ pub fn print_summary(app: &App) {
     println!("=== POC Selector Benchmark Results ===");
     println!("CPU: {}", app.system.cpu_model);
     let hw = &app.system.hw_features;
-    println!("HW:  POPCNT={} CTZ={} PTSelect={}", hw.popcnt, hw.ctz, hw.ptselect);
+    println!(
+        "HW:  POPCNT={} CTZ={} PTSelect={}",
+        hw.popcnt, hw.ctz, hw.ptselect
+    );
     println!(
         "Config: {} CPUs, {} workers, {} bg, {} idle, {} shadows/w",
         app.system.ncpus,
@@ -432,13 +470,15 @@ pub fn print_summary(app: &App) {
 
     if let (Some(on), Some(off)) = (app.final_on.as_ref(), app.final_off.as_ref()) {
         println!();
-        println!(
-            "{:>12} {:>14} {:>14} {:>12}",
-            "", "POC ON", "CFS", "Δ"
-        );
+        println!("{:>12} {:>14} {:>14} {:>12}", "", "POC ON", "CFS", "Δ");
         let rows: Vec<(&str, f64, f64, bool)> = vec![
             ("mean", on.mean / 1000.0, off.mean / 1000.0, true),
-            ("trimmed", on.trimmed_mean / 1000.0, off.trimmed_mean / 1000.0, true),
+            (
+                "trimmed",
+                on.trimmed_mean / 1000.0,
+                off.trimmed_mean / 1000.0,
+                true,
+            ),
             ("p50", on.p50 as f64 / 1000.0, off.p50 as f64 / 1000.0, true),
             ("p99", on.p99 as f64 / 1000.0, off.p99 as f64 / 1000.0, true),
             ("min", on.min as f64 / 1000.0, off.min as f64 / 1000.0, true),

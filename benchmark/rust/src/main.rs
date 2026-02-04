@@ -41,8 +41,7 @@ fn is_quit_event(ev: &Event) -> bool {
     match ev {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             key.code == KeyCode::Char('q')
-                || (key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL))
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         }
         _ => false,
     }
@@ -84,7 +83,10 @@ fn main() {
     let cli = Cli::parse();
     let sysinfo = SystemInfo::detect();
     let params = BenchParams::with_overrides(
-        sysinfo.ncpus, sysinfo.physical_cores, cli.threads, cli.background,
+        sysinfo.ncpus,
+        sysinfo.physical_cores,
+        cli.threads,
+        cli.background,
     );
 
     // Lock memory
@@ -108,7 +110,10 @@ fn main() {
 
     // Install SIGINT handler (Ctrl+C before raw mode / during calibration)
     unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
     }
 
     // Pre-check sysctl: readable AND writable?
@@ -224,7 +229,9 @@ fn main() {
 
     // --- Cleanup (always runs) ---
     if dma_latency_fd >= 0 {
-        unsafe { libc::close(dma_latency_fd); }
+        unsafe {
+            libc::close(dma_latency_fd);
+        }
     }
     if sysctl_writable && orig_poc >= 0 {
         system::poc_sysctl_write(orig_poc).ok();
@@ -257,14 +264,18 @@ fn run_comparison(
     system::poc_sysctl_write(1).ok();
     let h = bench::bench_burst_async(params, discard_n, discard_w);
     let _ = run_with_progress(terminal, app, &h);
-    if quitting() { return; }
+    if quitting() {
+        return;
+    }
 
     system::poc_sysctl_write(0).ok();
     app.progress = 0.5;
     terminal.draw(|f| ui::draw(f, app)).ok();
     let h = bench::bench_burst_async(params, discard_n, discard_w);
     let _ = run_with_progress(terminal, app, &h);
-    if quitting() { return; }
+    if quitting() {
+        return;
+    }
 
     // --- Measured rounds ---
     let mut results_on = Vec::new();
@@ -281,7 +292,9 @@ fn run_comparison(
         };
 
         for &(poc_on, _label) in &order {
-            if quitting() { break 'rounds; }
+            if quitting() {
+                break 'rounds;
+            }
 
             app.phase = Phase::Running {
                 round: round + 1,
@@ -295,7 +308,9 @@ fn run_comparison(
             let h = bench::bench_burst_async(params, iterations, warmup);
             let samples = run_with_progress(terminal, app, &h);
 
-            if quitting() { break 'rounds; }
+            if quitting() {
+                break 'rounds;
+            }
 
             if !samples.is_empty() {
                 let mut s = samples.clone();

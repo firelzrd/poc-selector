@@ -33,7 +33,12 @@ impl SystemInfo {
         let physical_cores = detect_physical_cores(ncpus);
         let cpu_model = read_cpu_model().unwrap_or_else(|| "Unknown".into());
         let hw_features = detect_hw_features();
-        Self { ncpus, physical_cores, cpu_model, hw_features }
+        Self {
+            ncpus,
+            physical_cores,
+            cpu_model,
+            hw_features,
+        }
     }
 }
 
@@ -65,7 +70,12 @@ impl BenchParams {
             None => (available / group).max(1),
         };
         let n_idle = available.saturating_sub(n_workers * group);
-        Self { n_workers, n_background, n_idle, shadows_per_worker }
+        Self {
+            n_workers,
+            n_background,
+            n_idle,
+            shadows_per_worker,
+        }
     }
 }
 
@@ -96,16 +106,18 @@ fn detect_physical_cores(ncpus: usize) -> usize {
         let pkg = fs::read_to_string(format!(
             "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
         ));
-        let core = fs::read_to_string(format!(
-            "/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
-        ));
+        let core = fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_id"));
         if let (Ok(p), Ok(c)) = (pkg, core) {
             if let (Ok(p), Ok(c)) = (p.trim().parse::<i32>(), c.trim().parse::<i32>()) {
                 cores.insert((p, c));
             }
         }
     }
-    if cores.is_empty() { ncpus } else { cores.len() }
+    if cores.is_empty() {
+        ncpus
+    } else {
+        cores.len()
+    }
 }
 
 fn read_cpu_model() -> Option<String> {

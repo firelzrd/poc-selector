@@ -38,10 +38,14 @@ impl StatResult {
         let sum: f64 = samples.iter().map(|&v| v as f64).sum();
         let mean = sum / n as f64;
 
-        let var: f64 = samples.iter().map(|&v| {
-            let d = v as f64 - mean;
-            d * d
-        }).sum::<f64>() / n as f64;
+        let var: f64 = samples
+            .iter()
+            .map(|&v| {
+                let d = v as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n as f64;
 
         // Trimmed mean: drop top/bottom 1% to remove outliers
         let lo = n / 100;
@@ -53,7 +57,16 @@ impl StatResult {
             mean
         };
 
-        Self { mean, trimmed_mean, stddev: var.sqrt(), min, max, p50, p99, count: n }
+        Self {
+            mean,
+            trimmed_mean,
+            stddev: var.sqrt(),
+            min,
+            max,
+            p50,
+            p99,
+            count: n,
+        }
     }
 
     pub fn merge(results: &[StatResult]) -> Self {
@@ -69,11 +82,24 @@ impl StatResult {
         let p50 = (results.iter().map(|r| r.p50 as f64).sum::<f64>() / n) as u64;
         let p99 = (results.iter().map(|r| r.p99 as f64).sum::<f64>() / n) as u64;
         let count = results.iter().map(|r| r.count).sum();
-        Self { mean, trimmed_mean, stddev, min, max, p50, p99, count }
+        Self {
+            mean,
+            trimmed_mean,
+            stddev,
+            min,
+            max,
+            p50,
+            p99,
+            count,
+        }
     }
 
     pub fn ops_per_sec(&self) -> f64 {
-        if self.mean <= 0.0 { 0.0 } else { 1e9 / self.mean }
+        if self.mean <= 0.0 {
+            0.0
+        } else {
+            1e9 / self.mean
+        }
     }
 }
 
@@ -100,6 +126,10 @@ impl Histogram {
     }
 
     pub fn fraction(&self, bucket: usize) -> f64 {
-        if self.total == 0 { 0.0 } else { self.buckets[bucket] as f64 / self.total as f64 }
+        if self.total == 0 {
+            0.0
+        } else {
+            self.buckets[bucket] as f64 / self.total as f64
+        }
     }
 }
