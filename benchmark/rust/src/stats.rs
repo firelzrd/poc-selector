@@ -38,21 +38,34 @@ impl StatResult {
         let sum: f64 = samples.iter().map(|&v| v as f64).sum();
         let mean = sum / n as f64;
 
-        let var: f64 = samples
-            .iter()
-            .map(|&v| {
-                let d = v as f64 - mean;
-                d * d
-            })
-            .sum::<f64>()
-            / n as f64;
+        let var: f64 = if n > 1 {
+            samples
+                .iter()
+                .map(|&v| {
+                    let d = v as f64 - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / (n - 1) as f64
+        } else {
+            0.0
+        };
 
-        // Trimmed mean: drop top/bottom 1% to remove outliers
-        let lo = n / 100;
-        let hi = n - lo;
-        let trimmed = &samples[lo..hi];
-        let trimmed_mean = if !trimmed.is_empty() {
-            trimmed.iter().map(|&v| v as f64).sum::<f64>() / trimmed.len() as f64
+        // IQR-based outlier removal: filter values outside Q1 - 3*IQR to Q3 + 3*IQR
+        let q1_idx = n / 4;
+        let q3_idx = 3 * n / 4;
+        let q1 = samples[q1_idx] as f64;
+        let q3 = samples[q3_idx] as f64;
+        let iqr = q3 - q1;
+        let lower = (q1 - 3.0 * iqr).max(0.0) as u64;
+        let upper = (q3 + 3.0 * iqr) as u64;
+        let filtered: Vec<u64> = samples
+            .iter()
+            .filter(|&&v| v >= lower && v <= upper)
+            .copied()
+            .collect();
+        let trimmed_mean = if !filtered.is_empty() {
+            filtered.iter().map(|&v| v as f64).sum::<f64>() / filtered.len() as f64
         } else {
             mean
         };
@@ -95,10 +108,10 @@ impl StatResult {
     }
 
     pub fn ops_per_sec(&self) -> f64 {
-        if self.mean <= 0.0 {
+        if self.trimmed_mean <= 0.0 {
             0.0
         } else {
-            1e9 / self.mean
+            1e9 / self.trimmed_mean
         }
     }
 }
