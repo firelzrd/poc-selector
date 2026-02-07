@@ -1,17 +1,17 @@
-From 1d1f1ab718a8d09131882379b3ae40fa683ab7f3 Mon Sep 17 00:00:00 2001
+From 930bee329a8dc61888ef654fe9f8424b67d8eeb0 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 7 Feb 2026 05:49:32 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v1.7
+Date: Sun, 8 Feb 2026 01:42:52 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v1.8
 
 ---
- include/linux/sched/topology.h |  21 +
- init/Kconfig                   |  26 +
- kernel/sched/fair.c            |  31 +-
- kernel/sched/idle.c            |   6 +
- kernel/sched/poc_selector.c    | 928 +++++++++++++++++++++++++++++++++
- kernel/sched/sched.h           |  13 +
- kernel/sched/topology.c        | 142 +++++
- 7 files changed, 1166 insertions(+), 1 deletion(-)
+ include/linux/sched/topology.h |   21 +
+ init/Kconfig                   |   26 +
+ kernel/sched/fair.c            |   31 +-
+ kernel/sched/idle.c            |    6 +
+ kernel/sched/poc_selector.c    | 1008 ++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h           |   14 +
+ kernel/sched/topology.c        |  145 +++++
+ 7 files changed, 1250 insertions(+), 1 deletion(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
@@ -167,10 +167,10 @@ index c39b089d4f..8a8a13bd6c 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..096f656adf
+index 0000000000..78a7b173e8
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,928 @@
+@@ -0,0 +1,1008 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -192,10 +192,14 @@ index 0000000000..096f656adf
 +
 +#ifdef CONFIG_SCHED_POC_SELECTOR
 +
++/**************************************************************
++ * Version and configuration macros:
++ */
++
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "1.7"
++#define SCHED_POC_SELECTOR_VERSION  "1.8"
 +
 +/*
 + * IF_SMT - conditionally include code only when SMT is enabled.
@@ -206,7 +210,11 @@ index 0000000000..096f656adf
 +#define IF_SMT(code) code
 +#else
 +#define IF_SMT(code)
-+#endif
++#endif /* CONFIG_SCHED_SMT */
++
++/**************************************************************
++ * Static keys:
++ */
 +
 +/*
 + * Runtime control: sched_poc_selector (sysctl kernel.sched_poc_selector)
@@ -225,13 +233,35 @@ index 0000000000..096f656adf
 + */
 +DEFINE_STATIC_KEY_TRUE(sched_poc_l2_cluster_search);
 +
-+static atomic_t poc_global_rr_seed = ATOMIC_INIT(0);
++/*
++ * sched_poc_single_word: true when all LLCs have nr_words == 1 (up to 64 CPUs)
++ *
++ * Enables compile-time elimination of the 2-word path for most systems.
++ * Defaults to true; disabled at boot if any LLC requires 2 words.
++ */
++DEFINE_STATIC_KEY_TRUE(sched_poc_single_word);
 +
-+/* --- Debug counters (CONFIG_SCHED_POC_SELECTOR_DEBUG) ---
++/**************************************************************
++ * Per-CPU variables:
++ */
++
++/*
++ * Per-CPU round-robin counter for idle CPU selection.
++ * Combined with CPU ID via golden ratio hash to ensure:
++ * - No atomic contention (per-CPU)
++ * - No thundering herd (different CPUs produce different seeds)
++ * - Good distribution (golden ratio multiplication)
++ */
++#define POC_HASH_MULT 0x9E3779B9U  /* golden ratio * 2^32 */
++static DEFINE_PER_CPU(u32, poc_rr_counter);
++
++/**************************************************************
++ * Debug counters:
 + *
 + * hit / fallthrough / selected are counted at the call site (fair.c).
 + * sticky / l2_hit / llc_hit are counted inside the DEFINE_SELECT_IDLE_CPU_POC macro.
 + */
++
 +#ifdef CONFIG_SCHED_POC_SELECTOR_DEBUG
 +static DEFINE_PER_CPU(u32, poc_dbg_hit);
 +static DEFINE_PER_CPU(u32, poc_dbg_fallthrough);
@@ -241,7 +271,7 @@ index 0000000000..096f656adf
 +#ifdef CONFIG_SCHED_SMT
 +static DEFINE_PER_CPU(u32, poc_dbg_smt_tgt);
 +static DEFINE_PER_CPU(u32, poc_dbg_l2_smt);
-+#endif
++#endif /* CONFIG_SCHED_SMT */
 +static DEFINE_PER_CPU(atomic_t, poc_dbg_selected);
 +
 +#define POC_DBG_INC_HIT()          __this_cpu_inc(poc_dbg_hit)
@@ -255,7 +285,7 @@ index 0000000000..096f656adf
 +#else
 +#define POC_DBG_INC_SMT_TGT()     do {} while (0)
 +#define POC_DBG_INC_L2_SMT()      do {} while (0)
-+#endif
++#endif /* CONFIG_SCHED_SMT */
 +#define POC_DBG_INC_SELECTED(cpu)  atomic_inc(&per_cpu(poc_dbg_selected, cpu))
 +#else
 +#define POC_DBG_INC_HIT()          do {} while (0)
@@ -266,7 +296,148 @@ index 0000000000..096f656adf
 +#define POC_DBG_INC_SMT_TGT()     do {} while (0)
 +#define POC_DBG_INC_L2_SMT()      do {} while (0)
 +#define POC_DBG_INC_SELECTED(cpu)  do {} while (0)
-+#endif
++#endif /* CONFIG_SCHED_POC_SELECTOR_DEBUG */
++
++/**************************************************************
++ * Bit manipulation primitives:
++ */
++
++/*
++ * POC_CTZ64 — Portable Count Trailing Zeros (64-bit)
++ *
++ * Three-tier architecture detection:
++ *
++ *   Tier 1: Native hardware CTZ with well-defined zero semantics
++ *     x86-64 + BMI1 (__BMI__): TZCNT — returns 64 for input 0
++ *     ARM64:                   RBIT + CLZ
++ *     RISC-V Zbb:              CTZ instruction
++ *
++ *   Tier 2: x86-64 without BMI1 (Bulldozer, pre-Haswell, etc.)
++ *     BSF is fast (~3 cyc) but UNDEFINED for input 0.
++ *     On AMD Bulldozer: BSF(0) leaves dest register unchanged (stale value).
++ *     On Intel pre-Haswell: BSF(0) is architecturally undefined.
++ *     Wrap with explicit zero check to guarantee returning 64.
++ *
++ *   Tier 3: De Bruijn fallback (BPF, unknown architectures)
++ *     Software multiply + 64-entry table lookup, branchless O(1).
++ */
++
++/* Tier 1: Hardware CTZ — zero-safe by definition */
++#if defined(__x86_64__) && defined(__BMI__)
++#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
++#define POC_CTZ64_NAME "HW (TZCNT)"
++
++#elif defined(__aarch64__)
++#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
++#define POC_CTZ64_NAME "HW (RBIT+CLZ)"
++
++#elif defined(__riscv) && defined(__riscv_zbb)
++#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
++#define POC_CTZ64_NAME "HW (ctz)"
++
++/* Tier 2: x86-64 without BMI1 — BSF is fast but zero is undefined */
++#elif defined(__x86_64__)
++static __always_inline int poc_ctz64_bsf(u64 v)
++{
++	if (unlikely(!v))
++		return 64;
++	return (int)__builtin_ctzll(v);
++}
++#define POC_CTZ64(v) poc_ctz64_bsf(v)
++#define POC_CTZ64_NAME "HW (BSF)"
++
++/*
++ * Tier 3: De Bruijn fallback — branchless software CTZ
++ *
++ * Based on the algorithm described in:
++ *   C. E. Leiserson, H. Prokop, K. H. Randall,
++ *   "Using de Bruijn Sequences to Index a 1 in a Computer Word", 1998.
++ */
++#else
++#define DEBRUIJN_CTZ64_CONST 0x03F79D71B4CA8B09ULL
++static const u8 debruijn_ctz64_tab[64] = {
++	 0,  1, 56,  2, 57, 49, 28,  3,
++	61, 58, 42, 50, 38, 29, 17,  4,
++	62, 47, 59, 36, 45, 43, 51, 22,
++	53, 39, 33, 30, 24, 18, 12,  5,
++	63, 55, 48, 27, 60, 41, 37, 16,
++	46, 35, 44, 21, 52, 32, 23, 11,
++	54, 26, 40, 15, 34, 20, 31, 10,
++	25, 14, 19,  9, 13,  8,  7,  6,
++};
++static __always_inline int debruijn_ctz64(u64 v)
++{
++	if (unlikely(!v))
++		return 64;
++	u64 lsb = v & (-(s64)v);
++	u32 idx = (u32)((lsb * DEBRUIJN_CTZ64_CONST) >> 58);
++	return (int)debruijn_ctz64_tab[idx & 63];
++}
++#define POC_CTZ64(v) debruijn_ctz64(v)
++#define POC_CTZ64_NAME "SW (De Bruijn)"
++
++#endif /* POC_CTZ64 */
++
++/*
++ * POC_PTSELECT — Select position of the j-th set bit in a 64-bit word
++ *
++ * Based on the algorithm described in:
++ *   P. Pandey, M. A. Bender, R. Johnson,
++ *   "A Fast x86 Implementation of Select", arXiv:1706.00990, 2017.
++ *
++ * Returns the bit position (0-indexed) of the j-th set bit in v.
++ * Undefined behavior if j >= popcount(v).
++ *
++ *   Tier 1 (x86-64 + BMI2, excluding AMD Zen 1/2 slow microcode PDEP):
++ *     PDEP + TZCNT — 4 instructions total.
++ *     PDEP deposits the j-th source bit at the j-th mask position.
++ *
++ *   Tier 2 (fallback): Iterative bit-clear — O(j) iterations
++ *     Clears the lowest set bit j times, then CTZ on remainder.
++ */
++
++#if defined(__x86_64__) && defined(__BMI2__) && \
++    !defined(__znver1) && !defined(__znver2)
++static __always_inline int poc_ptselect(u64 v, int j)
++{
++	u64 deposited;
++
++	asm("pdep %2, %1, %0" : "=r"(deposited) : "r"(1ULL << j), "rm"(v));
++	return POC_CTZ64(deposited);
++}
++#define POC_PTSELECT(v, j) poc_ptselect(v, j)
++#define POC_PTSELECT_NAME "HW (PDEP)"
++
++/*
++ * Tier 2 (fallback): Iterative bit-clear — O(j) iterations.
++ *   Clears the lowest set bit j times, then returns its position via CTZ.
++ */
++#else
++static __always_inline int poc_ptselect_sw(u64 v, int j)
++{
++	int k;
++
++	for (k = 0; k < j; k++)
++		v &= v - 1;	/* clear lowest set bit */
++	return POC_CTZ64(v);
++}
++#define POC_PTSELECT(v, j) poc_ptselect_sw(v, j)
++#define POC_PTSELECT_NAME "SW (loop)"
++
++#endif /* POC_PTSELECT */
++
++/*
++ * Map seed in [0, 2^32) to [0, range) without division — Lemire's fastrange
++ *
++ * Based on the algorithm described in:
++ *   D. Lemire, "Fast Random Integer Generation in an Interval",
++ *   ACM Trans. Model. Comput. Simul. 29, 1, Article 3, 2019.
++ */
++#define POC_FASTRANGE(seed, range) ((u32)(((u64)(seed) * (u32)(range)) >> 32))
++
++/**************************************************************
++ * Core idle state management:
++ */
 +
 +/*
 + * is_idle_core_poc - Check if all SMT siblings of a CPU are idle
@@ -372,122 +543,9 @@ index 0000000000..096f656adf
 +	}
 +}
 +
-+/*
-+ * POC_CTZ64 — Portable Count Trailing Zeros (64-bit)
-+ *
-+ * Three-tier architecture detection:
-+ *
-+ *   Tier 1: Native hardware CTZ with well-defined zero semantics
-+ *     x86-64 + BMI1 (__BMI__): TZCNT — returns 64 for input 0
-+ *     ARM64:                   RBIT + CLZ
-+ *     RISC-V Zbb:              CTZ instruction
-+ *
-+ *   Tier 2: x86-64 without BMI1 (Bulldozer, pre-Haswell, etc.)
-+ *     BSF is fast (~3 cyc) but UNDEFINED for input 0.
-+ *     On AMD Bulldozer: BSF(0) leaves dest register unchanged (stale value).
-+ *     On Intel pre-Haswell: BSF(0) is architecturally undefined.
-+ *     Wrap with explicit zero check to guarantee returning 64.
-+ *
-+ *   Tier 3: De Bruijn fallback (BPF, unknown architectures)
-+ *     Software multiply + 64-entry table lookup, branchless O(1).
++/**************************************************************
++ * Idle CPU selection helpers:
 + */
-+
-+/* Tier 1: Hardware CTZ — zero-safe by definition */
-+#if defined(__x86_64__) && defined(__BMI__)
-+#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
-+#define POC_CTZ64_NAME "HW (TZCNT)"
-+
-+#elif defined(__aarch64__)
-+#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
-+#define POC_CTZ64_NAME "HW (RBIT+CLZ)"
-+
-+#elif defined(__riscv) && defined(__riscv_zbb)
-+#define POC_CTZ64(v) ((int)__builtin_ctzll(v))
-+#define POC_CTZ64_NAME "HW (ctz)"
-+
-+/* Tier 2: x86-64 without BMI1 — BSF is fast but zero is undefined */
-+#elif defined(__x86_64__)
-+static __always_inline int poc_ctz64_bsf(u64 v)
-+{
-+	if (unlikely(!v))
-+		return 64;
-+	return (int)__builtin_ctzll(v);
-+}
-+#define POC_CTZ64(v) poc_ctz64_bsf(v)
-+#define POC_CTZ64_NAME "HW (BSF)"
-+
-+/* Tier 3: De Bruijn fallback — branchless software CTZ */
-+#else
-+#define DEBRUIJN_CTZ64_CONST 0x03F79D71B4CA8B09ULL
-+static const u8 debruijn_ctz64_tab[64] = {
-+	 0,  1, 56,  2, 57, 49, 28,  3,
-+	61, 58, 42, 50, 38, 29, 17,  4,
-+	62, 47, 59, 36, 45, 43, 51, 22,
-+	53, 39, 33, 30, 24, 18, 12,  5,
-+	63, 55, 48, 27, 60, 41, 37, 16,
-+	46, 35, 44, 21, 52, 32, 23, 11,
-+	54, 26, 40, 15, 34, 20, 31, 10,
-+	25, 14, 19,  9, 13,  8,  7,  6,
-+};
-+static __always_inline int debruijn_ctz64(u64 v)
-+{
-+	if (unlikely(!v))
-+		return 64;
-+	u64 lsb = v & (-(s64)v);
-+	u32 idx = (u32)((lsb * DEBRUIJN_CTZ64_CONST) >> 58);
-+	return (int)debruijn_ctz64_tab[idx & 63];
-+}
-+#define POC_CTZ64(v) debruijn_ctz64(v)
-+#define POC_CTZ64_NAME "SW (De Bruijn)"
-+
-+#endif /* POC_CTZ64 */
-+
-+/*
-+ * POC_PTSELECT — Select position of the j-th set bit in a 64-bit word
-+ *
-+ * Returns the bit position (0-indexed) of the j-th set bit in v.
-+ * Undefined behavior if j >= popcount(v).
-+ *
-+ *   Tier 1 (x86-64 + BMI2, excluding AMD Zen 1/2 slow microcode PDEP):
-+ *     PDEP + TZCNT — 4 instructions total.
-+ *     PDEP deposits the j-th source bit at the j-th mask position.
-+ *
-+ *   Tier 2 (fallback): Iterative bit-clear — O(j) iterations
-+ *     Clears the lowest set bit j times, then CTZ on remainder.
-+ */
-+
-+#if defined(__x86_64__) && defined(__BMI2__) && \
-+    !defined(__znver1) && !defined(__znver2)
-+static __always_inline int poc_ptselect(u64 v, int j)
-+{
-+	u64 deposited;
-+
-+	asm("pdep %2, %1, %0" : "=r"(deposited) : "r"(1ULL << j), "rm"(v));
-+	return POC_CTZ64(deposited);
-+}
-+#define POC_PTSELECT(v, j) poc_ptselect(v, j)
-+#define POC_PTSELECT_NAME "HW (PDEP)"
-+
-+/*
-+ * Tier 2 (fallback): Iterative bit-clear — O(j) iterations.
-+ *   Clears the lowest set bit j times, then returns its position via CTZ.
-+ */
-+#else
-+static __always_inline int poc_ptselect_sw(u64 v, int j)
-+{
-+	int k;
-+
-+	for (k = 0; k < j; k++)
-+		v &= v - 1;	/* clear lowest set bit */
-+	return POC_CTZ64(v);
-+}
-+#define POC_PTSELECT(v, j) poc_ptselect_sw(v, j)
-+#define POC_PTSELECT_NAME "SW (loop)"
-+
-+#endif /* POC_PTSELECT */
-+
-+/* Map seed in [0, 2^32) to [0, range) without division — Lemire's fastrange */
-+#define POC_FASTRANGE(seed, range) ((u32)(((u64)(seed) * (u32)(range)) >> 32))
 +
 +/*
 + * poc_ptselect_multi - Select the pick-th idle CPU across multi-word mask
@@ -611,6 +669,10 @@ index 0000000000..096f656adf
 +}
 +#endif /* CONFIG_SCHED_SMT */
 +
++/**************************************************************
++ * Fast path dispatcher:
++ */
++
 +/*
 + * DEFINE_SELECT_IDLE_CPU_POC - Generate an N-word variant of the fast path
 + *
@@ -676,7 +738,7 @@ index 0000000000..096f656adf
 +	 * level that consumes it. */ \
 +	{ \
 +		unsigned int seed; \
-+		seed = (unsigned int)atomic_inc_return(&poc_global_rr_seed);\
++		seed = __this_cpu_inc_return(poc_rr_counter) * POC_HASH_MULT; \
 +		\
 +		if (has_idle_core && sched_smt_active()) { \
 +			/* === Phase 2: Core search (no SMT contention) === */ \
@@ -786,14 +848,15 @@ index 0000000000..096f656adf
 +				int target,
 +				struct sched_domain_shared *sd_share)
 +{
-+	int nr_words = sd_share->poc_nr_words;
-+	switch (nr_words) {
-+	case 1: return select_idle_cpu_poc_1(has_idle_core, target, sd_share);
-+	case 2: return select_idle_cpu_poc_2(has_idle_core, target, sd_share);
-+	}
-+
-+	return -1;
++	if (static_branch_likely(&sched_poc_single_word))
++		return select_idle_cpu_poc_1(has_idle_core, target, sd_share);
++	else
++		return select_idle_cpu_poc_2(has_idle_core, target, sd_share);
 +}
++
++/**************************************************************
++ * Sysctl interface and initialization:
++ */
 +
 +#ifdef CONFIG_SYSCTL
 +/*
@@ -891,11 +954,28 @@ index 0000000000..096f656adf
 +
 +#endif /* CONFIG_SYSCTL */
 +
-+/* --- sysfs exposure (CONFIG_SCHED_POC_SELECTOR_DEBUG) ---
++/*
++ * Initialize per-CPU RR counters with CPU ID in upper bits.
++ * This ensures different CPUs produce different seeds without
++ * needing to call smp_processor_id() at runtime.
++ */
++static int __init sched_poc_rr_init(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		per_cpu(poc_rr_counter, cpu) = (u32)cpu << 24;
++	return 0;
++}
++early_initcall(sched_poc_rr_init);
++
++/**************************************************************
++ * Debug: sysfs interface
 + *
 + * Exported at /sys/kernel/poc_selector/ so non-root users can read
 + * counters.  Uses kobject + kobj_attribute (no debugfs dependency).
 + */
++
 +#ifdef CONFIG_SCHED_POC_SELECTOR_DEBUG
 +
 +static u64 poc_dbg_sum_percpu(u32 __percpu *var)
@@ -933,7 +1013,7 @@ index 0000000000..096f656adf
 +#ifdef CONFIG_SCHED_SMT
 +DEFINE_POC_DBG_ATTR(smt_tgt);
 +DEFINE_POC_DBG_ATTR(l2_smt);
-+#endif
++#endif /* CONFIG_SCHED_SMT */
 +
 +/* Per-CPU selected counter — dynamically allocated per CPU */
 +struct poc_selected_attr {
@@ -966,7 +1046,7 @@ index 0000000000..096f656adf
 +#ifdef CONFIG_SCHED_SMT
 +		per_cpu(poc_dbg_smt_tgt, cpu) = 0;
 +		per_cpu(poc_dbg_l2_smt, cpu) = 0;
-+#endif
++#endif /* CONFIG_SCHED_SMT */
 +		atomic_set(&per_cpu(poc_dbg_selected, cpu), 0);
 +	}
 +	return count;
@@ -1024,7 +1104,7 @@ index 0000000000..096f656adf
 +#ifdef CONFIG_SCHED_SMT
 +	&poc_attr_smt_tgt.attr,
 +	&poc_attr_l2_smt.attr,
-+#endif
++#endif /* CONFIG_SCHED_SMT */
 +	&poc_attr_reset.attr,
 +	NULL,
 +};
@@ -1100,15 +1180,16 @@ index 0000000000..096f656adf
 +#endif /* CONFIG_SCHED_POC_SELECTOR_DEBUG */
 +#endif /* CONFIG_SCHED_POC_SELECTOR */
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index adfb6e3409..4937d94204 100644
+index adfb6e3409..7d49e6d885 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -3134,6 +3134,19 @@ extern void nohz_run_idle_balance(int cpu);
+@@ -3134,6 +3134,20 @@ extern void nohz_run_idle_balance(int cpu);
  static inline void nohz_run_idle_balance(int cpu) { }
  #endif
  
 +#ifdef CONFIG_SCHED_POC_SELECTOR
 +extern struct static_key_true sched_poc_enabled;
++extern struct static_key_true sched_poc_single_word;
 +extern void __set_cpu_idle_state(int cpu, int state);
 +static __always_inline void set_cpu_idle_state(int cpu, int state)
 +{
@@ -1124,10 +1205,10 @@ index adfb6e3409..4937d94204 100644
  
  #if defined(CONFIG_SCHED_CORE) && defined(CONFIG_SCHEDSTATS)
 diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
-index 444bdfdab7..b4d45f2701 100644
+index 444bdfdab7..dfde02a606 100644
 --- a/kernel/sched/topology.c
 +++ b/kernel/sched/topology.c
-@@ -1717,6 +1717,148 @@ sd_init(struct sched_domain_topology_level *tl,
+@@ -1717,6 +1717,151 @@ sd_init(struct sched_domain_topology_level *tl,
  		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
  		atomic_inc(&sd->shared->ref);
  		atomic_set(&sd->shared->nr_busy_cpus, sd_weight);
@@ -1141,6 +1222,9 @@ index 444bdfdab7..b4d45f2701 100644
 +		if (nr_words <= POC_MASK_WORDS_MAX) {
 +			sd->shared->poc_nr_words = nr_words;
 +			sd->shared->poc_fast_eligible = true;
++			/* Disable single-word optimization if this LLC needs 2 words */
++			if (nr_words > 1)
++				static_branch_disable(&sched_poc_single_word);
 +		} else {
 +			sd->shared->poc_nr_words = 0;
 +			sd->shared->poc_fast_eligible = false;
