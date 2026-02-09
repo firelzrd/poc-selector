@@ -55,11 +55,6 @@ fn default_threads() -> usize {
     1
 }
 
-fn default_background() -> usize {
-    let ncpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize };
-    (ncpus as f64).log2().round() as usize
-}
-
 #[derive(Parser)]
 #[command(name = "poc-bench", about = "POC Selector Benchmark with TUI")]
 struct Cli {
@@ -71,9 +66,9 @@ struct Cli {
     #[arg(short = 't', long, default_value_t = default_threads())]
     threads: usize,
 
-    /// Background thread count
-    #[arg(short, long, default_value_t = default_background())]
-    background: usize,
+    /// Background thread count (default: physical_cores / 2)
+    #[arg(short, long)]
+    background: Option<usize>,
 
     /// Number of comparison rounds
     #[arg(short, long, default_value_t = DEFAULT_ROUNDS)]
@@ -95,7 +90,7 @@ fn main() {
         sysinfo.ncpus,
         sysinfo.physical_cores,
         Some(cli.threads),
-        Some(cli.background),
+        cli.background,
     );
 
     // Lock memory

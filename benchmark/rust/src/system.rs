@@ -45,7 +45,7 @@ impl SystemInfo {
 impl BenchParams {
     #[allow(dead_code)]
     pub fn calculate(ncpus: usize, physical_cores: usize) -> Self {
-        let n_background = physical_cores * 3 / 4;
+        let n_background = physical_cores / 2;
         Self::compute(ncpus, n_background, None)
     }
 
@@ -55,7 +55,7 @@ impl BenchParams {
         workers: Option<usize>,
         background: Option<usize>,
     ) -> Self {
-        let n_background = background.unwrap_or(physical_cores * 3 / 4);
+        let n_background = background.unwrap_or(physical_cores / 2);
         Self::compute(ncpus, n_background, workers)
     }
 
