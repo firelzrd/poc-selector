@@ -1,17 +1,17 @@
-From 930bee329a8dc61888ef654fe9f8424b67d8eeb0 Mon Sep 17 00:00:00 2001
+From 1e7cfe77b6c4e976c8cd037c5452ec15fc38b5af Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 8 Feb 2026 01:42:52 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v1.8
+Date: Mon, 9 Feb 2026 10:18:21 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v1.8.1
 
 ---
  include/linux/sched/topology.h |   21 +
  init/Kconfig                   |   26 +
  kernel/sched/fair.c            |   31 +-
  kernel/sched/idle.c            |    6 +
- kernel/sched/poc_selector.c    | 1008 ++++++++++++++++++++++++++++++++
+ kernel/sched/poc_selector.c    | 1119 ++++++++++++++++++++++++++++++++
  kernel/sched/sched.h           |   14 +
  kernel/sched/topology.c        |  145 +++++
- 7 files changed, 1250 insertions(+), 1 deletion(-)
+ 7 files changed, 1361 insertions(+), 1 deletion(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
@@ -167,10 +167,10 @@ index c39b089d4f..8a8a13bd6c 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..78a7b173e8
+index 0000000000..369cc6c8f2
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,1008 @@
+@@ -0,0 +1,1119 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -199,7 +199,7 @@ index 0000000000..78a7b173e8
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "1.8"
++#define SCHED_POC_SELECTOR_VERSION  "1.8.1"
 +
 +/*
 + * IF_SMT - conditionally include code only when SMT is enabled.
@@ -970,6 +970,159 @@ index 0000000000..78a7b173e8
 +early_initcall(sched_poc_rr_init);
 +
 +/**************************************************************
++ * Status: sysfs interface (always available)
++ *
++ * Exported at /sys/kernel/poc_selector/status/ for runtime status queries.
++ * Reports whether POC is actually active (combining all conditions).
++ */
++
++#ifdef CONFIG_SYSFS
++
++/* Root kobject shared with debug section */
++static struct kobject *kobj_poc_root;
++
++static bool poc_check_all_llc_eligible(void)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		struct sched_domain_shared *sd_share;
++
++		rcu_read_lock();
++		sd_share = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++		if (sd_share && !sd_share->poc_fast_eligible) {
++			rcu_read_unlock();
++			return false;
++		}
++		rcu_read_unlock();
++	}
++	return true;
++}
++
++static ssize_t active_show(struct kobject *kobj,
++			   struct kobj_attribute *attr, char *buf)
++{
++	bool active = static_branch_likely(&sched_poc_enabled) &&
++		      !sched_asym_cpucap_active() &&
++		      poc_check_all_llc_eligible();
++	return sysfs_emit(buf, "%d\n", active ? 1 : 0);
++}
++
++static ssize_t symmetric_cpucap_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", sched_asym_cpucap_active() ? 0 : 1);
++}
++
++static ssize_t all_llc_eligible_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", poc_check_all_llc_eligible() ? 1 : 0);
++}
++
++static ssize_t version_show(struct kobject *kobj,
++			    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n", SCHED_POC_SELECTOR_VERSION);
++}
++
++static struct kobj_attribute poc_status_active_attr = __ATTR_RO(active);
++static struct kobj_attribute poc_status_asym_attr = __ATTR_RO(symmetric_cpucap);
++static struct kobj_attribute poc_status_eligible_attr = __ATTR_RO(all_llc_eligible);
++static struct kobj_attribute poc_status_version_attr = __ATTR_RO(version);
++
++static struct attribute *poc_status_attrs[] = {
++	&poc_status_active_attr.attr,
++	&poc_status_asym_attr.attr,
++	&poc_status_eligible_attr.attr,
++	&poc_status_version_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group poc_status_group = {
++	.name = "status",
++	.attrs = poc_status_attrs,
++};
++
++/* --- hw_accel: expose which hardware acceleration is in use --- */
++
++#define DEFINE_POC_HW_ATTR(fname, namestr) \
++static ssize_t poc_hw_##fname##_show(struct kobject *kobj, \
++		struct kobj_attribute *attr, char *buf) \
++{ \
++	return sysfs_emit(buf, "%s\n", namestr); \
++} \
++static struct kobj_attribute poc_hw_attr_##fname = { \
++	.attr = { .name = #fname, .mode = 0444 }, \
++	.show = poc_hw_##fname##_show, \
++}
++
++DEFINE_POC_HW_ATTR(ctz, POC_CTZ64_NAME);
++DEFINE_POC_HW_ATTR(ptselect, POC_PTSELECT_NAME);
++
++/* popcnt: x86 uses runtime alternatives, detect via boot_cpu_has */
++static ssize_t poc_hw_popcnt_show(struct kobject *kobj,
++				  struct kobj_attribute *attr, char *buf)
++{
++#if defined(__x86_64__)
++	return sysfs_emit(buf, "%s\n",
++		boot_cpu_has(X86_FEATURE_POPCNT) ? "HW (POPCNT)" : "SW");
++#elif defined(__aarch64__)
++	return sysfs_emit(buf, "HW (CNT)\n");
++#elif defined(__riscv) && defined(__riscv_zbb)
++	return sysfs_emit(buf, "HW (cpop)\n");
++#else
++	return sysfs_emit(buf, "SW\n");
++#endif
++}
++
++static struct kobj_attribute poc_hw_attr_popcnt = {
++	.attr = { .name = "popcnt", .mode = 0444 },
++	.show = poc_hw_popcnt_show,
++};
++
++static struct attribute *poc_hw_attrs[] = {
++	&poc_hw_attr_popcnt.attr,
++	&poc_hw_attr_ctz.attr,
++	&poc_hw_attr_ptselect.attr,
++	NULL,
++};
++
++static const struct attribute_group poc_hw_group = {
++	.name = "hw_accel",
++	.attrs = poc_hw_attrs,
++};
++
++static int __init sched_poc_status_init(void)
++{
++	int ret;
++
++	kobj_poc_root = kobject_create_and_add("poc_selector", kernel_kobj);
++	if (!kobj_poc_root)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(kobj_poc_root, &poc_status_group);
++	if (ret)
++		goto err_status;
++
++	ret = sysfs_create_group(kobj_poc_root, &poc_hw_group);
++	if (ret)
++		goto err_hw;
++
++	return 0;
++
++err_hw:
++	sysfs_remove_group(kobj_poc_root, &poc_status_group);
++err_status:
++	kobject_put(kobj_poc_root);
++	kobj_poc_root = NULL;
++	return ret;
++}
++late_initcall(sched_poc_status_init);
++
++#endif /* CONFIG_SYSFS */
++
++/**************************************************************
 + * Debug: sysfs interface
 + *
 + * Exported at /sys/kernel/poc_selector/ so non-root users can read
@@ -1057,43 +1210,6 @@ index 0000000000..78a7b173e8
 +	.store = poc_dbg_reset_store,
 +};
 +
-+/* --- hw_accel: expose which hardware acceleration is in use --- */
-+
-+#define DEFINE_POC_HW_ATTR(fname, namestr) \
-+static ssize_t poc_hw_##fname##_show(struct kobject *kobj, \
-+		struct kobj_attribute *attr, char *buf) \
-+{ \
-+	return sysfs_emit(buf, "%s\n", namestr); \
-+} \
-+static struct kobj_attribute poc_hw_attr_##fname = { \
-+	.attr = { .name = #fname, .mode = 0444 }, \
-+	.show = poc_hw_##fname##_show, \
-+}
-+
-+DEFINE_POC_HW_ATTR(ctz, POC_CTZ64_NAME);
-+DEFINE_POC_HW_ATTR(ptselect, POC_PTSELECT_NAME);
-+
-+/* popcnt: x86 uses runtime alternatives, detect via boot_cpu_has */
-+static ssize_t poc_hw_popcnt_show(struct kobject *kobj,
-+				  struct kobj_attribute *attr, char *buf)
-+{
-+#if defined(__x86_64__)
-+	return sysfs_emit(buf, "%s\n",
-+		boot_cpu_has(X86_FEATURE_POPCNT) ? "HW (POPCNT)" : "SW");
-+#elif defined(__aarch64__)
-+	return sysfs_emit(buf, "HW (CNT)\n");
-+#elif defined(__riscv) && defined(__riscv_zbb)
-+	return sysfs_emit(buf, "HW (cpop)\n");
-+#else
-+	return sysfs_emit(buf, "SW\n");
-+#endif
-+}
-+
-+static struct kobj_attribute poc_hw_attr_popcnt = {
-+	.attr = { .name = "popcnt", .mode = 0444 },
-+	.show = poc_hw_popcnt_show,
-+};
-+
 +/* Attribute groups for batch registration */
 +static struct attribute *poc_counter_attrs[] = {
 +	&poc_attr_hit.attr,
@@ -1113,32 +1229,31 @@ index 0000000000..78a7b173e8
 +	.attrs = poc_counter_attrs,
 +};
 +
-+static struct attribute *poc_hw_attrs[] = {
-+	&poc_hw_attr_popcnt.attr,
-+	&poc_hw_attr_ctz.attr,
-+	&poc_hw_attr_ptselect.attr,
-+	NULL,
-+};
-+
-+static const struct attribute_group poc_hw_group = {
-+	.attrs = poc_hw_attrs,
-+};
-+
 +static int __init sched_poc_debug_init(void)
 +{
-+	struct kobject *kobj_poc, *kobj_sel, *kobj_hw;
++	struct kobject *kobj_poc, *kobj_counters, *kobj_cpu;
 +	int cpu, ret;
++	bool created_here = false;
 +
-+	kobj_poc = kobject_create_and_add("poc_selector", kernel_kobj);
-+	if (!kobj_poc)
-+		return -ENOMEM;
++	/* Reuse root kobject from status init, or create if not present */
++	kobj_poc = kobj_poc_root;
++	if (!kobj_poc) {
++		kobj_poc = kobject_create_and_add("poc_selector", kernel_kobj);
++		if (!kobj_poc)
++			return -ENOMEM;
++		created_here = true;
++	}
 +
-+	ret = sysfs_create_group(kobj_poc, &poc_counter_group);
-+	if (ret)
++	kobj_counters = kobject_create_and_add("counters", kobj_poc);
++	if (!kobj_counters)
 +		goto err_poc;
 +
-+	kobj_sel = kobject_create_and_add("selected", kobj_poc);
-+	if (kobj_sel) {
++	ret = sysfs_create_group(kobj_counters, &poc_counter_group);
++	if (ret)
++		goto err_counters;
++
++	kobj_cpu = kobject_create_and_add("cpu", kobj_counters);
++	if (kobj_cpu) {
 +		for_each_possible_cpu(cpu) {
 +			struct poc_selected_attr *sa;
 +
@@ -1154,7 +1269,7 @@ index 0000000000..78a7b173e8
 +			sa->kattr.attr.mode = 0444;
 +			sa->kattr.show = poc_selected_show;
 +			sysfs_attr_init(&sa->kattr.attr);
-+			ret = sysfs_create_file(kobj_sel, &sa->kattr.attr);
++			ret = sysfs_create_file(kobj_cpu, &sa->kattr.attr);
 +			if (ret) {
 +				kfree(sa->kattr.attr.name);
 +				kfree(sa);
@@ -1162,17 +1277,13 @@ index 0000000000..78a7b173e8
 +		}
 +	}
 +
-+	kobj_hw = kobject_create_and_add("hw_accel", kobj_poc);
-+	if (kobj_hw) {
-+		ret = sysfs_create_group(kobj_hw, &poc_hw_group);
-+		if (ret)
-+			kobject_put(kobj_hw);
-+	}
-+
 +	return 0;
 +
++err_counters:
++	kobject_put(kobj_counters);
 +err_poc:
-+	kobject_put(kobj_poc);
++	if (created_here)
++		kobject_put(kobj_poc);
 +	return ret;
 +}
 +late_initcall(sched_poc_debug_init);
