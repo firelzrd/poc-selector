@@ -9,36 +9,41 @@ achieving O(1) lookup instead of linear scanning.
 
 This project was born from the ideas pioneered by
 [RitzDaCat](https://github.com/RitzDaCat) in
-[scx_cake](https://github.com/RitzDaCat/scx_cake) — a sched_ext BPF scheduler of extraordinary originality and ambition.  
-Where most scheduler projects (including mine) iterate on well-known designs, scx_cake charted its own course: a from-scratch architecture that boldly rethinks how scheduling decisions should be made.  
+[scx_cake](https://github.com/RitzDaCat/scx_cake) — a sched_ext BPF scheduler of extraordinary originality and ambition.
+Where most scheduler projects (including mine) iterate on well-known designs, scx_cake charted its own course: a from-scratch architecture that boldly rethinks how scheduling decisions should be made.
 The creative vision and technical depth behind scx_cake are truly remarkable, and studying it was a catalyst for exploring what a similar bitmask-driven approach could look like inside the mainline CFS code path.
 
 POC Selector distills one specific insight from scx_cake — fast idle-CPU selection via cached bitmasks — and transplants it into the kernel's `select_idle_cpu()` hot path as a lightweight, non-invasive patch.
 
 ## Key Characteristics
 
-- **O(1) idle CPU discovery** via atomic64 bitmasks
-- **6-level priority hierarchy** for cache locality optimization
+- **O(1) idle CPU discovery** via a single atomic64 bitmask per LLC
+- **7-level priority hierarchy** for cache locality optimization
+- **Affinity-aware** — filters by task's `cpus_ptr` before search
+- **Load balancer acceleration** — O(1) idle lookup in `sched_balance_find_dst_group_cpu` and `update_sg_lb_stats`
+- **Prefetch-optimized** — strategic cacheline prefetching across all hot paths
 - **Zero-overhead when disabled** via static keys
-- **Supports up to 128 CPUs per LLC** (2 × 64-bit words)
+- **Supports up to 64 CPUs per LLC** (single 64-bit word)
 
 ## Features
 
 - **Fast idle CPU search** — Bitmap-based O(1) lookup replaces O(n) linear scan
 - **SMT contention avoidance** — Strict preference for idle physical cores over SMT siblings
 - **Cache hierarchy awareness** — L1 → L2 → L3 locality optimization
+- **Load balancer fast paths** — Bitmap-based idle CPU counting and lookup for periodic load balancing
 
 ## How It Works
 
 POC Selector maintains **per-LLC `atomic64_t` bitmasks** that track which CPUs (and which physical cores) are idle.
 When the scheduler needs an idle CPU for task wakeup, it consults these bitmasks instead of scanning every CPU in the domain.
 
-When the fast path cannot handle the request (LLC > 128 CPUs, restricted affinity, etc.), the standard `select_idle_cpu()` takes over transparently.
+When the fast path cannot handle the request (LLC > 64 CPUs, asymmetric CPU capacity, etc.), the standard `select_idle_cpu()` takes over transparently.
 
 ### Key Properties
 
 - **Lock-free** — each CPU only modifies its own bit; no spinlocks needed
 - **SMT-aware** — prefers idle physical cores over idle SMT siblings
+- **Affinity-aware** — intersects idle mask with task's `cpus_ptr` before any search
 - **Zero fairness impact** — only changes *where* a task is placed, not scheduling order
 - **Runtime toggle** — `sysctl kernel.sched_poc_selector` (0/1, default 1)
 
@@ -67,9 +72,9 @@ if (!has_idle_core && cpus_share_cache(prev, target)) {
 
 **POC behavior**: Always executes idle core search first (Phase 2), falling back to SMT siblings only when all physical cores are busy (Phase 3).
 
-### 6-Level Priority Hierarchy
+### 7-Level Priority Hierarchy
 
-POC implements a strict 6-level priority hierarchy optimized for cache locality:
+POC implements a strict 7-level priority hierarchy optimized for cache locality:
 
 ```
 Phase 1: Early Return
@@ -78,13 +83,15 @@ Phase 1: Early Return
 
 Phase 2: Core Search (SMT systems only, no contention)
   Level 2: L2 cluster idle core — Idle core within L2 cluster
-  Level 3: LLC-wide idle core   — Idle core anywhere in LLC
+  Level 3: LLC-wide idle core   — Idle core anywhere in LLC (round-robin)
 
 Phase 3: CPU Search (all cores busy, SMT fallback)
   Level 4: Target SMT sibling   — Idle sibling of target (L1+L2 shared)
   Level 5: L2 cluster SMT       — Any idle CPU within L2 cluster
   Level 6: LLC-wide CPU         — Any idle CPU via round-robin
 ```
+
+On non-SMT systems, Phase 3 is skipped entirely and Phase 2 operates on logical CPUs instead of physical cores.
 
 ### Performance Trade-off Analysis
 
@@ -100,6 +107,39 @@ The "inversion phenomenon": POC's strict idle core priority may appear to cost m
 - SMT siblings share execution units (ALU, FPU, load/store units)
 - Typical SMT throughput penalty: 15-40% depending on workload
 - POC's additional selection cost (~50 cycles) is negligible compared to execution savings
+
+---
+
+## Accelerated Code Paths
+
+POC accelerates three distinct scheduler paths:
+
+### 1. Task Wakeup (`select_idle_sibling`)
+
+The hottest path — called on every task wakeup. Replaces both `select_idle_smt()` and `select_idle_cpu()` with a single bitmap-based O(1) lookup.
+
+### 2. Load Balancer Group CPU (`sched_balance_find_dst_group_cpu`)
+
+Replaces the `for_each_cpu_and` loop that searches for an idle CPU within a scheduling group. O(1) lookup via `atomic64_read` + bitwise AND + CTZ.
+
+### 3. Load Balancer Stats (`update_sg_lb_stats`)
+
+Replaces per-CPU `idle_cpu()` calls with:
+- **POPCNT** for O(1) idle CPU counting
+- **Bitmap test** for O(1) per-CPU idle check in the stats loop
+
+---
+
+## Prefetch Strategy
+
+POC uses strategic prefetching to hide cache miss latency on the `poc_idle_cpus` cacheline, which is `____cacheline_aligned` and separated from the fields read during eligibility checks:
+
+| Site | Target | Hiding Window | Latency Reduced |
+|------|--------|---------------|-----------------|
+| `select_idle_sibling` (fair.c) | `poc_idle_cpus` | eligible check + function call + cpumask conversion | ~25-35 cyc |
+| `select_idle_cpu_poc` (Level 1 miss) | `poc_cluster_mask[tgt_bit]`, `poc_smt_siblings[tgt_bit]` | seed computation + `poc_idle_cores` read | ~11-14 cyc |
+| `poc_find_idle_cpu_in_group` | `poc_idle_cpus` | `cpumask_subset` scan | ~34-50 cyc |
+| `poc_lb_prepare_idle_check` | `poc_idle_cpus` | `cpumask_subset` scan | ~34-50 cyc |
 
 ---
 
@@ -163,7 +203,7 @@ Maps [0, 2^32) → [0, range) without division using Lemire's fastrange algorith
 |-----|---------|---------|
 | `sched_poc_enabled` | true | Master POC on/off |
 | `sched_poc_l2_cluster_search` | true | L2 cluster search |
-| `sched_poc_single_word` | true | Single-word optimization (≤64 CPUs) |
+| `sched_poc_aligned` | true | Fast cpumask conversion (disabled if any LLC base is non-64-aligned) |
 | `sched_cluster_active` | auto | Cluster topology detection |
 
 - When disabled: Compiles to NOP (complete zero overhead)
@@ -191,8 +231,8 @@ seed = __this_cpu_inc_return(poc_rr_counter) * POC_HASH_MULT;
 ### Lock-Free Atomic Bitmask
 
 ```c
-atomic64_t poc_idle_cpus[POC_MASK_WORDS_MAX];   // Logical CPUs
-atomic64_t poc_idle_cores[POC_MASK_WORDS_MAX];  // Physical cores (SMT only)
+atomic64_t poc_idle_cpus ____cacheline_aligned;  // Logical CPUs
+atomic64_t poc_idle_cores;                        // Physical cores (SMT only)
 ```
 
 **Update operations**:
@@ -204,36 +244,36 @@ atomic64_t poc_idle_cores[POC_MASK_WORDS_MAX];  // Physical cores (SMT only)
 - `smp_mb__after_atomic()`: On x86, compiles to compiler barrier only (0 cycles)
 - On ARM64: emits `dmb ish`
 
+**Cacheline isolation**: `____cacheline_aligned` ensures LOCK-prefixed writes to these bitmaps on idle transitions do not invalidate the cacheline containing `nr_busy_cpus` / `has_idle_cores` / `nr_idle_scan`.
+
 ---
 
 ### Pre-computed Masks
 
 | Mask | Purpose | Lookup Complexity |
 |------|---------|-------------------|
-| `poc_smt_siblings[bit]` | SMT sibling mask per CPU | O(1) |
-| `poc_cluster_mask[bit]` | L2 cluster mask per CPU | O(1) |
+| `poc_smt_siblings[bit]` | SMT sibling mask per CPU (excl. self) | O(1) |
+| `poc_cluster_mask[bit]` | L2 cluster mask per CPU (excl. self) | O(1) |
 
 - Computed at boot time in topology.c
 - Avoids runtime cpumask iteration
+- Read-only after initialization → stable in L2/L3 cache
 
 ---
 
-### Macro-Expanded Variants
+### Affinity-Aware Filtering
 
 ```c
-DEFINE_SELECT_IDLE_CPU_POC(1)  // Up to 64 CPUs per LLC
-DEFINE_SELECT_IDLE_CPU_POC(2)  // Up to 128 CPUs per LLC
+static __always_inline u64 poc_cpumask_to_u64(const struct cpumask *mask,
+                                              struct sched_domain_shared *sd_share)
 ```
 
-- Fully expanded at compile time
-- Loop counters are constants → complete unrolling
+Converts a full cpumask to a POC-relative u64 for bitwise intersection with idle bitmaps. Two paths:
 
----
+- **Aligned** (common): Single word load when LLC base is 64-aligned
+- **Unaligned** (e.g. Threadripper CCDs): Two-word load + shift
 
-### Deferred Evaluation
-
-- POPCNT calls are deferred until actually needed
-- Level 1 (target sticky) early return avoids all POPCNT overhead
+The `sched_poc_aligned` static key eliminates the branch at runtime.
 
 ---
 
@@ -241,8 +281,9 @@ DEFINE_SELECT_IDLE_CPU_POC(2)  // Up to 128 CPUs per LLC
 
 - **Kernel**: Linux kernel built with `CONFIG_SCHED_POC_SELECTOR=y` (default)
 - **SMP**: Requires `CONFIG_SMP` (multi-processor kernel)
-- **Max 128 logical CPUs per LLC**: The bitmask is backed by 2 × `atomic64_t` words (`POC_MASK_WORDS_MAX = 2`), covering up to 128 CPUs per Last-Level Cache domain
-- **Graceful fallback**: When the LLC contains more than 128 CPUs, a task has restricted CPU affinity (`taskset`, `cpuset`, etc.), or no idle CPUs exist in the LLC, the selector transparently falls back to the standard `select_idle_cpu()` — no error, no performance penalty beyond losing the fast path
+- **Max 64 logical CPUs per LLC**: The bitmask is backed by a single `atomic64_t` word covering up to 64 CPUs per Last-Level Cache domain
+- **Symmetric CPU capacity only**: Disabled on big.LITTLE / hybrid architectures (`sched_asym_cpucap_active`)
+- **Graceful fallback**: When the LLC contains more than 64 CPUs, the system has asymmetric CPU capacity, or no idle CPUs exist in the LLC, the selector transparently falls back to the standard `select_idle_cpu()` — no error, no performance penalty beyond losing the fast path
 - **Runtime toggle**: Can be disabled at runtime via `sysctl kernel.sched_poc_selector=0`
 
 ---
@@ -258,27 +299,44 @@ DEFINE_SELECT_IDLE_CPU_POC(2)  // Up to 128 CPUs per LLC
 
 ---
 
-## Debug Interface
+## Sysfs Interface
 
-When `CONFIG_SCHED_POC_SELECTOR_DEBUG=y` is enabled, statistics are exposed via sysfs:
+### Status (always available with `CONFIG_SYSFS`)
 
 ```
-/sys/kernel/poc_selector/
+/sys/kernel/poc_selector/status/
+├── active              # 1 if POC is fully active (enabled + symmetric + eligible)
+├── symmetric_cpucap    # 1 if CPU capacity is symmetric (not big.LITTLE)
+├── all_llc_eligible    # 1 if all LLCs have ≤64 CPUs
+└── version             # POC Selector version string
+```
+
+### Hardware Acceleration Info
+
+```
+/sys/kernel/poc_selector/hw_accel/
+├── ctz               # CTZ implementation in use (e.g. "HW (TZCNT)")
+├── ptselect          # PTSelect implementation in use (e.g. "HW (PDEP)")
+└── popcnt            # POPCNT implementation in use (e.g. "HW (POPCNT)")
+```
+
+### Debug Counters (requires `CONFIG_SCHED_POC_SELECTOR_DEBUG=y`)
+
+```
+/sys/kernel/poc_selector/counters/
 ├── hit               # Total POC successes
 ├── fallthrough       # POC failures (fell through to CFS)
 ├── sticky            # Level 1 hits (target was idle)
 ├── l2_hit            # Level 2 hits (L2 cluster idle core)
 ├── llc_hit           # Level 3 hits (LLC-wide idle core)
-├── smt_tgt           # Level 4 hits (target SMT sibling)
-├── l2_smt            # Level 5 hits (L2 cluster SMT)
+├── smt_tgt           # Level 4 hits (target SMT sibling) [SMT only]
+├── l2_smt            # Level 5 hits (L2 cluster SMT) [SMT only]
 ├── reset             # Write to reset all counters (root only)
-├── selected/
-│   └── cpu{N}        # Per-CPU selection counts
-└── hw_accel/
-    ├── ctz           # CTZ implementation in use
-    ├── ptselect      # PTSelect implementation in use
-    └── popcnt        # POPCNT implementation in use
+└── cpu/
+    └── cpu{N}        # Per-CPU selection counts
 ```
+
+**Derived metric**: SMT search count (Level 4+5+6) = hit - sticky - l2_hit - llc_hit
 
 ---
 
@@ -288,7 +346,7 @@ Apply the patch to a Linux source tree:
 
 ```bash
 cd /path/to/linux-6.18.3
-git apply /path/to/poc-selector/patches/0001-6.18.3-poc-selector-v1.0.patch
+git apply /path/to/poc-selector/patches/0001-6.18.3-poc-selector-v1.9.0-beta1.patch
 ```
 
 After building and booting the patched kernel, the feature is enabled by default.
@@ -328,7 +386,7 @@ The benchmark requires root to toggle `/proc/sys/kernel/sched_poc_selector`.
 
 ## Special Thanks
 
-RitzDaCat - of course, for giving birth to scx_cake inspiring me of implementing the selector.  
+RitzDaCat - of course, for giving birth to scx_cake inspiring me of implementing the selector.
 Mario Roy - for advising me about the PTSelect algorithm use
 
 ## License
