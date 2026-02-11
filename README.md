@@ -9,8 +9,8 @@ with lock-free stores and O(1) reader aggregation, replacing linear scanning.
 
 This project was born from the ideas pioneered by
 [RitzDaCat](https://github.com/RitzDaCat) in
-[scx_cake](https://github.com/RitzDaCat/scx_cake) — a sched_ext BPF scheduler of extraordinary originality and ambition.
-Where most scheduler projects (including mine) iterate on well-known designs, scx_cake charted its own course: a from-scratch architecture that boldly rethinks how scheduling decisions should be made.
+[scx_cake](https://github.com/RitzDaCat/scx_cake) — a sched_ext BPF scheduler of extraordinary originality and ambition.  
+Where most scheduler projects (including mine) iterate on well-known designs, scx_cake charted its own course: a from-scratch architecture that boldly rethinks how scheduling decisions should be made.  
 The creative vision and technical depth behind scx_cake are truly remarkable, and studying it was a catalyst for exploring what a similar bitmask-driven approach could look like inside the mainline CFS code path.
 
 POC Selector distills one specific insight from scx_cake — fast idle-CPU selection via cached bitmasks — and transplants it into the kernel's `select_idle_cpu()` hot path as a lightweight, non-invasive patch.
@@ -388,8 +388,8 @@ sudo sysctl kernel.sched_poc_selector=1
 
 ## Special Thanks
 
-RitzDaCat - of course, for giving birth to scx_cake inspiring me of implementing the selector.
-Mario Roy - for advising me about the PTSelect algorithm use, providing me lots of test suites and more.
+RitzDaCat - of course, for giving birth to scx_cake inspiring me of implementing the selector.  
+Mario Roy - for advising me about the PTSelect algorithm use, providing me lots of test suites and more.  
 The CachyOS Community Members - who patiently contributed with many useful feedbacks.
 
 ## License
