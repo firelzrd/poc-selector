@@ -20,7 +20,7 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 - **O(1) idle CPU discovery** via shared `u8[64]` flag arrays per LLC with lock-free `WRITE_ONCE` stores and multiply-and-shift reader aggregation
 - **7-level priority hierarchy** for cache locality optimization
 - **Affinity-aware** — filters by task's `cpus_ptr` before search
-- **Load balancer acceleration** — O(1) idle lookup in `sched_balance_find_dst_group_cpu` and `update_sg_lb_stats`
+- **Load balancer acceleration (planned)** — O(1) idle lookup in `sched_balance_find_dst_group_cpu` and `update_sg_lb_stats` (not yet implemented; may be added in a future release)
 - **Prefetch-optimized** — conditional cacheline prefetching with "fire early, use late" pipeline
 - **Zero-overhead when disabled** via static keys
 - **Supports up to 64 CPUs per LLC** (single 64-bit word after aggregation)
@@ -33,7 +33,7 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 - **BMI2 PEXT acceleration** — Single-instruction flag extraction on supported hardware (Intel, AMD Zen 3+)
 - **SMT contention avoidance** — Strict preference for idle physical cores over SMT siblings
 - **Cache hierarchy awareness** — L1 → L2 → L3 locality optimization
-- **Load balancer fast paths** — Bitmap-based idle CPU counting and lookup for periodic load balancing
+- **Load balancer fast paths (planned)** — Bitmap-based idle CPU counting and lookup for periodic load balancing (not yet implemented; may be added in a future release)
 
 ## How It Works
 
@@ -118,19 +118,23 @@ The "inversion phenomenon": POC's strict idle core priority may appear to cost m
 
 ## Accelerated Code Paths
 
-POC accelerates three distinct scheduler paths:
+POC currently accelerates the task wakeup path, with load balancer acceleration planned for a future release:
 
 ### 1. Task Wakeup (`select_idle_sibling`)
 
 The hottest path — called on every task wakeup. Replaces both `select_idle_smt()` and `select_idle_cpu()` with a single bitmap-based O(1) lookup.
 
-### 2. Load Balancer Group CPU (`sched_balance_find_dst_group_cpu`)
+### 2. Load Balancer Group CPU (`sched_balance_find_dst_group_cpu`) — *planned*
 
-Replaces the `for_each_cpu_and` loop that searches for an idle CPU within a scheduling group. O(1) lookup via flag aggregation + bitwise AND + CTZ.
+> **Note**: This path was prototyped during v2 development but is not included in the current implementation. It may be added in a future release.
 
-### 3. Load Balancer Stats (`update_sg_lb_stats`)
+Would replace the `for_each_cpu_and` loop that searches for an idle CPU within a scheduling group. O(1) lookup via flag aggregation + bitwise AND + CTZ.
 
-Replaces per-CPU `idle_cpu()` calls with:
+### 3. Load Balancer Stats (`update_sg_lb_stats`) — *planned*
+
+> **Note**: This path was prototyped during v2 development but is not included in the current implementation. It may be added in a future release.
+
+Would replace per-CPU `idle_cpu()` calls with:
 - **POPCNT** for O(1) idle CPU counting
 - **Bitmap test** for O(1) per-CPU idle check in the stats loop
 
