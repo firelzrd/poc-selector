@@ -18,9 +18,9 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 ## Key Characteristics
 
 - **O(1) idle CPU discovery** via shared `u8[64]` flag arrays per LLC with lock-free `WRITE_ONCE` stores and multiply-and-shift reader aggregation
-- **7-level priority hierarchy** for cache locality optimization
+- **6-level priority hierarchy** for cache locality optimization
 - **Affinity-aware** — filters by task's `cpus_ptr` before search
-- **Load balancer acceleration (planned)** — O(1) idle lookup in `sched_balance_find_dst_group_cpu` and `update_sg_lb_stats` (not yet implemented; may be added in a future release)
+- **SIS_UTIL-aware** — respects CFS's overload detection before LLC-wide search
 - **Prefetch-optimized** — conditional cacheline prefetching with "fire early, use late" pipeline
 - **Zero-overhead when disabled** via static keys
 - **Supports up to 64 CPUs per LLC** (single 64-bit word after aggregation)
@@ -33,7 +33,6 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 - **BMI2 PEXT acceleration** — Single-instruction flag extraction on supported hardware (Intel, AMD Zen 3+)
 - **SMT contention avoidance** — Strict preference for idle physical cores over SMT siblings
 - **Cache hierarchy awareness** — L1 → L2 → L3 locality optimization
-- **Load balancer fast paths (planned)** — Bitmap-based idle CPU counting and lookup for periodic load balancing (not yet implemented; may be added in a future release)
 
 ## How It Works
 
@@ -76,28 +75,40 @@ if (!has_idle_core && cpus_share_cache(prev, target)) {
 }
 ```
 
-**POC behavior**: Always executes idle core search first (Phase 2), falling back to SMT siblings only when all physical cores are busy (Phase 3).
+**POC behavior**: Always executes idle core search first, falling back to SMT siblings only when all physical cores are busy.
 
-### 7-Level Priority Hierarchy
+### 6-Level Priority Hierarchy
 
-POC implements a strict 7-level priority hierarchy optimized for cache locality:
+POC implements a strict 6-level priority hierarchy optimized for cache locality:
 
 ```
 Phase 1: Early Return
-  Level 0: Saturation check     — No idle CPUs → return -1 (fallback to CFS)
+  Level 0: Saturation check     — No idle CPUs → return -1 (CFS fallback)
 
-Phase 2: Core Search (SMT systems only, no contention)
-  Level 1: prev idle core sticky — prev CPU's core fully idle → return prev (cache-hot)
-  Level 2: L2 cluster idle core  — Idle core within L2 cluster (round-robin)
+Phase 2: Sticky (prev affinity)
+  Level 1a: prev sticky          — Non-SMT: prev is idle → return prev (cache-hot)
+  Level 1b: prev/sibling sticky  — SMT: prev or sibling idle → return (before idle_cores read)
+
+Phase 3: Core/CPU Search
+  SIS_UTIL gate                  — Respect CFS overload detection before LLC-wide search
+  Level 2: L2 cluster idle core  — Idle core within target's L2 cluster (round-robin)
   Level 3: LLC-wide idle core    — Idle core anywhere in LLC (round-robin)
-
-Phase 3: CPU Search (all cores busy, SMT fallback)
-  Level 4: prev SMT sibling     — Idle sibling of prev CPU (L1+L2 shared, cache-hot)
-  Level 5: L2 cluster CPU       — Any idle CPU within L2 cluster (round-robin)
-  Level 6: LLC-wide CPU         — Any idle CPU via round-robin
+  Level 4: L2 cluster CPU        — Any idle CPU within target's L2 cluster (round-robin)
+  Level 5: LLC-wide CPU          — Any idle CPU via round-robin
 ```
 
-On non-SMT systems, Phase 3 is skipped entirely and Phase 2 operates on logical CPUs instead of physical cores (Level 1 checks prev idle CPU directly).
+On non-SMT systems, Level 1b is skipped and Level 1a checks the prev idle CPU directly.
+On SMT systems, Level 1b runs before reading idle_cores, matching CFS's "prev idle → return prev" behavior.
+Levels 2-3 search the idle-core bitmap; levels 4-5 search the idle-CPU bitmap (fallback when no full cores are free).
+
+### SIS_UTIL Gate
+
+Before the LLC-wide search (Levels 2-5), POC respects CFS's SIS_UTIL overload detection:
+
+- **Gate 1**: `nr_idle_scan == 0` — LLC utilization exceeds ~85%, skip search
+- **Gate 2**: `E[hits] = idle × nr / total < 1` — Models CFS's budget-limited scan. If the expected number of idle hits in CFS's scan budget is less than 1, POC also bails out
+
+When either gate triggers, POC returns -1 to let CFS handle the fallback path.
 
 ### Performance Trade-off Analysis
 
@@ -116,27 +127,11 @@ The "inversion phenomenon": POC's strict idle core priority may appear to cost m
 
 ---
 
-## Accelerated Code Paths
+## Accelerated Code Path
 
-POC currently accelerates the task wakeup path, with load balancer acceleration planned for a future release:
-
-### 1. Task Wakeup (`select_idle_sibling`)
+### Task Wakeup (`select_idle_sibling`)
 
 The hottest path — called on every task wakeup. Replaces both `select_idle_smt()` and `select_idle_cpu()` with a single bitmap-based O(1) lookup.
-
-### 2. Load Balancer Group CPU (`sched_balance_find_dst_group_cpu`) — *planned*
-
-> **Note**: This path was prototyped during v2 development but is not included in the current implementation. It may be added in a future release.
-
-Would replace the `for_each_cpu_and` loop that searches for an idle CPU within a scheduling group. O(1) lookup via flag aggregation + bitwise AND + CTZ.
-
-### 3. Load Balancer Stats (`update_sg_lb_stats`) — *planned*
-
-> **Note**: This path was prototyped during v2 development but is not included in the current implementation. It may be added in a future release.
-
-Would replace per-CPU `idle_cpu()` calls with:
-- **POPCNT** for O(1) idle CPU counting
-- **Bitmap test** for O(1) per-CPU idle check in the stats loop
 
 ---
 
@@ -151,7 +146,7 @@ Prefetches are skipped when the data would be consumed in the very next instruct
 | 1 | `poc_idle_cpus[64]` | Function entry | `poc_cpumask_to_u64()` computation | 0% — always needed |
 | 2 | `poc_idle_cores[64]` (SMT) | After affinity computation | `poc_read_idle_cpus()` + saturation check | Low — wasted only when fully saturated |
 | 3 | `poc_smt_mask[prev_bit]` (SMT) | After affinity computation | `poc_read_idle_cpus()` + saturation check | Low — wasted when prev not local or fully saturated |
-| 4 | `poc_cluster_mask[prev_bit]` | Start of cluster/RR block | Seed computation (per-CPU RMW + MUL) | 0% on non-cluster (static branch NOP) |
+| 4 | `poc_cluster_mask[target_bit]` | Start of cluster/RR block | Seed computation (per-CPU RMW + MUL) | 0% on non-cluster (static branch NOP) |
 
 ---
 
@@ -265,6 +260,7 @@ Maps [0, 2^32) → [0, range) without division using Lemire's fastrange algorith
 | `poc_chunks_bit2` | false | Binary dispatch bit 2 (chunks > 4) |
 | `poc_chunks_bit1` | false | Binary dispatch bit 1 |
 | `poc_chunks_bit0` | false | Binary dispatch bit 0 |
+| `sched_poc_count_enabled` | false | Debug counter collection |
 | `sched_cluster_active` | auto | Cluster topology detection |
 
 - When disabled: Compiles to NOP (complete zero overhead)
@@ -337,6 +333,7 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 |-----------|---------|-------------|
 | `kernel.sched_poc_selector` | 1 | Enable/disable POC selector |
 | `kernel.sched_poc_l2_cluster_search` | 1 | Enable/disable L2 cluster search |
+| `kernel.sched_poc_count` | 0 | Enable/disable per-level hit counter collection |
 
 ---
 
@@ -360,6 +357,20 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 ├── ptselect          # PTSelect implementation in use (e.g. "HW (PDEP)")
 ├── chunk             # Chunk aggregation in use (e.g. "HW (PEXT)" or "SW (MUL)")
 └── popcnt            # POPCNT implementation in use (e.g. "HW (POPCNT)")
+```
+
+### Hit Counters (enabled by `kernel.sched_poc_count=1`)
+
+```
+/sys/kernel/poc_selector/count/
+├── l1a               # Level 1a hits (prev sticky, non-SMT)
+├── l1b               # Level 1b hits (prev/sibling sticky, SMT)
+├── l2                # Level 2 hits (idle core in L2 cluster)
+├── l3                # Level 3 hits (idle core across LLC)
+├── l4                # Level 4 hits (idle CPU in L2 cluster)
+├── l5                # Level 5 hits (idle CPU across LLC)
+├── fallback          # Fallback hits (POC returned -1, CFS took over)
+└── reset             # Write 1 to reset all counters
 ```
 
 ---
