@@ -24,7 +24,7 @@ from collections import deque
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSpinBox, QCheckBox,
+    QPushButton, QLabel, QSpinBox, QCheckBox, QStackedWidget,
 )
 from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF
 from PyQt5.QtGui import (
@@ -35,26 +35,34 @@ from PyQt5.QtGui import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
-HIST_BOUNDS_NS = [500, 1000, 2000, 4000, 8000, 16000, 32000, float("inf")]
-HIST_LABELS = [
-    "0\u20130.5\u00b5s", "0.5\u20131\u00b5s", "1\u20132\u00b5s", "2\u20134\u00b5s",
-    "4\u20138\u00b5s", "8\u201316\u00b5s", "16\u201332\u00b5s", ">32\u00b5s",
+HIST_BOUNDS_NS = [
+    1000, 2000, 4000, 8000, 16_000, 32_000,
+    64_000, 128_000, 256_000, 512_000, 1_024_000, float("inf"),
 ]
-NUM_BUCKETS = 8
+HIST_LABELS = [
+    "0\u20131\u00b5s", "1\u20132\u00b5s", "2\u20134\u00b5s", "4\u20138\u00b5s",
+    "8\u201316\u00b5s", "16\u201332\u00b5s", "32\u201364\u00b5s", "64\u2013128\u00b5s",
+    "128\u2013256\u00b5s", "256\u2013512\u00b5s", "0.5\u20131ms", ">1ms",
+]
+NUM_BUCKETS = 12
 
 SYSCTL_POC_PATH = "/proc/sys/kernel/sched_poc_selector"
 
 BAR_COLORS = [
     QColor(0, 230, 118),
+    QColor(40, 230, 90),
     QColor(76, 230, 76),
-    QColor(156, 240, 0),
+    QColor(130, 240, 30),
+    QColor(190, 240, 0),
     QColor(240, 230, 0),
     QColor(255, 193, 7),
-    QColor(255, 138, 0),
-    QColor(255, 61, 0),
-    QColor(244, 0, 0),
+    QColor(255, 160, 0),
+    QColor(255, 120, 0),
+    QColor(255, 80, 0),
+    QColor(255, 40, 0),
+    QColor(230, 0, 0),
 ]
 
 BG_COLOR = QColor(18, 18, 36)
@@ -284,7 +292,6 @@ class SpectrumWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(500, 250)
-        self._vals = [0.0] * NUM_BUCKETS
         self._disp = [0.0] * NUM_BUCKETS
         self._peak = [0.0] * NUM_BUCKETS
         self._peak_age = [0] * NUM_BUCKETS
@@ -306,7 +313,7 @@ class SpectrumWidget(QWidget):
                 self._peak_age[i] = 0
             else:
                 self._peak_age[i] += 1
-                if self._peak_age[i] > 30:  # hold ~1s then decay
+                if self._peak_age[i] > 30:
                     self._peak[i] = max(0.0, self._peak[i] - 0.008)
         self.update()
 
@@ -321,7 +328,6 @@ class SpectrumWidget(QWidget):
         ch = h - mt - mb
         cx, cy = ml, mt
 
-        # grid
         pen_grid = QPen(GRID_COLOR, 1, Qt.DotLine)
         font_sm = QFont("monospace", 8)
         for i in range(5):
@@ -333,7 +339,6 @@ class SpectrumWidget(QWidget):
             p.drawText(0, y - 8, ml - 6, 16, Qt.AlignRight | Qt.AlignVCenter,
                        f"{i * 25}%")
 
-        # bars
         gap = 6
         bw = (cw - gap * (NUM_BUCKETS + 1)) / NUM_BUCKETS
 
@@ -353,7 +358,6 @@ class SpectrumWidget(QWidget):
                 p.setPen(Qt.NoPen)
                 p.drawRoundedRect(QRectF(x, by, bw, bh), 3, 3)
 
-                # reflection (mirror below baseline)
                 ref_h = min(bh * 0.25, 30)
                 ref_grad = QLinearGradient(x, cy + ch, x, cy + ch + ref_h)
                 rc = QColor(col)
@@ -364,13 +368,11 @@ class SpectrumWidget(QWidget):
                 p.setBrush(QBrush(ref_grad))
                 p.drawRect(QRectF(x, cy + ch, bw, ref_h))
 
-                # pct label
                 p.setPen(TEXT_COLOR)
                 p.setFont(QFont("monospace", 8, QFont.Bold))
                 p.drawText(int(x), int(by) - 16, int(bw), 14,
                            Qt.AlignCenter, f"{v * 100:.0f}%")
 
-            # peak hold
             pk = self._peak[i]
             if pk > 0.01:
                 py_ = int(cy + ch - pk * ch)
@@ -379,21 +381,120 @@ class SpectrumWidget(QWidget):
                 p.setPen(QPen(pc, 2))
                 p.drawLine(int(x + 1), py_, int(x + bw - 1), py_)
 
-            # x label
             p.setPen(TEXT_COLOR)
             p.setFont(font_sm)
             p.drawText(int(x), cy + ch + 8, int(bw), 18,
                        Qt.AlignCenter, HIST_LABELS[i])
 
-        # baseline
         p.setPen(QPen(GRID_COLOR, 1))
         p.drawLine(cx, cy + ch, cx + cw, cy + ch)
 
-        # axis title
         p.setPen(TEXT_DIM)
         p.setFont(QFont("monospace", 9))
         p.drawText(cx, cy + ch + 32, cw, 18,
                    Qt.AlignCenter, "Wakeup Latency Distribution")
+        p.end()
+
+# ---------------------------------------------------------------------------
+
+HEATMAP_MAX_COLS = 600
+
+# Inferno-inspired palette: black → purple → red → orange → yellow → white
+_HMAP_STOPS = [
+    (0.00, (10, 10, 28)),
+    (0.05, (40, 10, 80)),
+    (0.15, (90, 10, 120)),
+    (0.30, (170, 30, 60)),
+    (0.50, (220, 90, 10)),
+    (0.70, (250, 180, 20)),
+    (0.90, (255, 240, 120)),
+    (1.00, (255, 255, 255)),
+]
+
+def _hmap_color(v):
+    """Map 0..1 fraction to QColor via palette."""
+    v = max(0.0, min(1.0, v))
+    for i in range(1, len(_HMAP_STOPS)):
+        t1, c1 = _HMAP_STOPS[i]
+        if v <= t1:
+            t0, c0 = _HMAP_STOPS[i - 1]
+            f = (v - t0) / (t1 - t0) if t1 > t0 else 0
+            r = int(c0[0] + (c1[0] - c0[0]) * f)
+            g = int(c0[1] + (c1[1] - c0[1]) * f)
+            b = int(c0[2] + (c1[2] - c0[2]) * f)
+            return QColor(r, g, b)
+    return QColor(255, 255, 255)
+
+
+class HeatmapWidget(QWidget):
+    """Scrolling heatmap: X=time, Y=latency buckets, color=fraction."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(500, 250)
+        self._cols = deque(maxlen=HEATMAP_MAX_COLS)
+
+    def clear(self):
+        self._cols.clear()
+        self.update()
+
+    def set_values(self, vals):
+        self._cols.append(list(vals))
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, BG_COLOR)
+
+        ml, mr, mt, mb = 65, 15, 15, 20
+        cw = w - ml - mr
+        ch = h - mt - mb
+        cx, cy = ml, mt
+        n = len(self._cols)
+
+        # Y-axis labels (bucket labels, bottom = low latency)
+        font_sm = QFont("monospace", 8)
+        rh = ch / NUM_BUCKETS
+        for i in range(NUM_BUCKETS):
+            row = NUM_BUCKETS - 1 - i  # flip: low latency at bottom
+            y = cy + i * rh
+            p.setPen(TEXT_DIM)
+            p.setFont(font_sm)
+            p.drawText(0, int(y), ml - 6, int(rh),
+                       Qt.AlignRight | Qt.AlignVCenter, HIST_LABELS[row])
+            # horizontal grid
+            p.setPen(QPen(GRID_COLOR, 1, Qt.DotLine))
+            p.drawLine(cx, int(y), cx + cw, int(y))
+
+        if n == 0:
+            p.setPen(TEXT_DIM)
+            p.setFont(QFont("monospace", 10))
+            p.drawText(cx, cy, cw, ch, Qt.AlignCenter, "Waiting for data\u2026")
+            p.end()
+            return
+
+        # draw heatmap cells
+        col_w = cw / min(n, HEATMAP_MAX_COLS)
+        p.setPen(Qt.NoPen)
+        for ci, col in enumerate(self._cols):
+            x = cx + cw - (n - ci) * col_w
+            if x + col_w < cx:
+                continue
+            for bi in range(NUM_BUCKETS):
+                row = NUM_BUCKETS - 1 - bi  # flip
+                y = cy + row * rh
+                p.fillRect(QRectF(x, y, col_w + 0.5, rh), _hmap_color(col[bi]))
+
+        # border
+        p.setPen(QPen(GRID_COLOR, 1))
+        p.drawRect(QRectF(cx, cy, cw, ch))
+
+        # axis title
+        p.setPen(TEXT_DIM)
+        p.setFont(QFont("monospace", 9))
+        p.drawText(cx, cy + ch + 4, cw, 16,
+                   Qt.AlignCenter, "Wakeup Latency Heatmap  \u2190 time")
         p.end()
 
 # ---------------------------------------------------------------------------
@@ -560,6 +661,7 @@ class MainWindow(QMainWindow):
 
         self._poc_lbl = QLabel("POC: ---")
         self._poc_lbl.setFont(QFont("monospace", 13, QFont.Bold))
+        self._poc_lbl.setFixedWidth(100)
         top.addWidget(self._poc_lbl)
 
         self._poc_btn = QPushButton("Toggle POC")
@@ -596,9 +698,14 @@ class MainWindow(QMainWindow):
         mid.addWidget(self._workers_lbl)
         vbox.addLayout(mid)
 
-        # ---- spectrum ----
-        self._spectrum = SpectrumWidget()
-        vbox.addWidget(self._spectrum, 3)
+        # ---- main view (bars / heatmap) ----
+        self._bars = SpectrumWidget()
+        self._heatmap = HeatmapWidget()
+        self._view_stack = QStackedWidget()
+        self._view_stack.addWidget(self._bars)
+        self._view_stack.addWidget(self._heatmap)
+        self._view_stack.setCurrentIndex(0)  # bars default
+        vbox.addWidget(self._view_stack, 3)
 
         # ---- timeline ----
         self._timeline = TimelineWidget()
@@ -628,6 +735,11 @@ class MainWindow(QMainWindow):
         self._cstates = cstate_detect()
         self._cs_orig_disable = None
         self._nr_cpus = ncpu
+
+        self._view_btn = QPushButton("Heatmap")
+        self._view_btn.setFixedWidth(80)
+        self._view_btn.clicked.connect(self._toggle_view)
+        ctrl.addWidget(self._view_btn)
 
         self._clr_btn = QPushButton("Clear")
         self._clr_btn.setFixedWidth(70)
@@ -770,6 +882,15 @@ class MainWindow(QMainWindow):
         if self._running:
             self._update_workers_lbl()
 
+    def _toggle_view(self):
+        idx = self._view_stack.currentIndex()
+        if idx == 0:  # bars → heatmap
+            self._view_stack.setCurrentIndex(1)
+            self._view_btn.setText("Bars")
+        else:  # heatmap → bars
+            self._view_stack.setCurrentIndex(0)
+            self._view_btn.setText("Heatmap")
+
     def _clear_graphs(self):
         self._buf.clear()
         try:
@@ -777,7 +898,8 @@ class MainWindow(QMainWindow):
                 self._queue.popleft()
         except IndexError:
             pass
-        self._spectrum.clear()
+        self._bars.clear()
+        self._heatmap.clear()
         self._timeline.clear()
         self._cur_mean = 0.0
         self._cur_p50 = 0.0
@@ -861,7 +983,8 @@ class MainWindow(QMainWindow):
         if total == 0:
             return
         frac = [h / total for h in hist]
-        self._spectrum.set_values(frac)
+        self._bars.set_values(frac)
+        self._heatmap.set_values(frac)
 
         # percentiles (subsample if huge)
         if n > 50_000:
