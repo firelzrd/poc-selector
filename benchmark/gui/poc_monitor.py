@@ -35,6 +35,8 @@ from PyQt5.QtGui import (
 # Constants
 # ---------------------------------------------------------------------------
 
+VERSION = "0.1.1"
+
 HIST_BOUNDS_NS = [500, 1000, 2000, 4000, 8000, 16000, 32000, float("inf")]
 HIST_LABELS = [
     "0\u20130.5\u00b5s", "0.5\u20131\u00b5s", "1\u20132\u00b5s", "2\u20134\u00b5s",
@@ -405,19 +407,22 @@ class TimelineWidget(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(110)
         self.setMaximumHeight(170)
+        self._mean = deque(maxlen=TIMELINE_MAX)
         self._p50 = deque(maxlen=TIMELINE_MAX)
         self._p99 = deque(maxlen=TIMELINE_MAX)
         self._poc = deque(maxlen=TIMELINE_MAX)
         self._ymax = 10.0
 
     def clear(self):
+        self._mean.clear()
         self._p50.clear()
         self._p99.clear()
         self._poc.clear()
         self._ymax = 10.0
         self.update()
 
-    def add(self, p50, p99, poc):
+    def add(self, mean, p50, p99, poc):
+        self._mean.append(mean)
         self._p50.append(p50)
         self._p99.append(p99)
         self._poc.append(poc)
@@ -474,18 +479,24 @@ class TimelineWidget(QWidget):
                    QColor(255, 90, 90, 180))
         self._line(p, list(self._p50), cx, cy, cw, ch, off, dx,
                    QColor(90, 255, 120, 220))
+        self._line(p, list(self._mean), cx, cy, cw, ch, off, dx,
+                   QColor(100, 180, 255, 200))
 
         # legend
-        lx = cx + cw - 110
+        lx = cx + cw - 160
         p.setFont(QFont("monospace", 8))
-        p.setPen(QPen(QColor(90, 255, 120), 2))
+        p.setPen(QPen(QColor(100, 180, 255), 2))
         p.drawLine(lx, cy + 6, lx + 14, cy + 6)
         p.setPen(TEXT_COLOR)
-        p.drawText(lx + 18, cy, 30, 12, Qt.AlignLeft, "p50")
-        p.setPen(QPen(QColor(255, 90, 90), 2))
-        p.drawLine(lx + 50, cy + 6, lx + 64, cy + 6)
+        p.drawText(lx + 18, cy, 36, 12, Qt.AlignLeft, "mean")
+        p.setPen(QPen(QColor(90, 255, 120), 2))
+        p.drawLine(lx + 54, cy + 6, lx + 68, cy + 6)
         p.setPen(TEXT_COLOR)
-        p.drawText(lx + 68, cy, 30, 12, Qt.AlignLeft, "p99")
+        p.drawText(lx + 72, cy, 30, 12, Qt.AlignLeft, "p50")
+        p.setPen(QPen(QColor(255, 90, 90), 2))
+        p.drawLine(lx + 102, cy + 6, lx + 116, cy + 6)
+        p.setPen(TEXT_COLOR)
+        p.drawText(lx + 120, cy, 30, 12, Qt.AlignLeft, "p99")
         p.end()
 
     def _line(self, p, data, cx, cy, cw, ch, off, dx, color):
@@ -534,7 +545,7 @@ QCheckBox::indicator:checked { background: #3a7a3a; border-color: #4a9a4a; }
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("POC Latency Spectrum Analyzer")
+        self.setWindowTitle(f"POC Latency Spectrum Analyzer v{VERSION}")
         self.setMinimumSize(920, 660)
         self.setStyleSheet(_DARK_STYLE)
 
@@ -646,8 +657,8 @@ class MainWindow(QMainWindow):
         ctrl2.addWidget(self._cs_chk)
 
         ctrl2.addSpacing(15)
-        self._ts_chk = QCheckBox("Timer slack \u2192 0")
-        self._ts_chk.setToolTip("Set timer slack to 0 ns (minimal)")
+        self._ts_chk = QCheckBox("Disable timer slack")
+        self._ts_chk.setToolTip("Set timer slack to 1 ns (minimum; 0 resets to default)")
         ctrl2.addWidget(self._ts_chk)
 
         ctrl2.addSpacing(15)
@@ -667,6 +678,7 @@ class MainWindow(QMainWindow):
         self._rate_cnt = 0
         self._rate_t = time.monotonic()
         self._cur_rate = 0
+        self._cur_mean = 0.0
         self._cur_p50 = 0.0
         self._cur_p99 = 0.0
         self._sleep_ns_ref = [DEFAULT_SLEEP_US * 1000]  # shared mutable
@@ -767,6 +779,7 @@ class MainWindow(QMainWindow):
             pass
         self._spectrum.clear()
         self._timeline.clear()
+        self._cur_mean = 0.0
         self._cur_p50 = 0.0
         self._cur_p99 = 0.0
         self._stats_lbl.setText("mean: --  p50: --  p95: --  p99: --")
@@ -802,7 +815,7 @@ class MainWindow(QMainWindow):
         if self._cs_chk.isChecked():
             parts.append("C0")
         if self._ts_chk.isChecked():
-            parts.append("slack=0")
+            parts.append("no slack")
         if self._spin_chk.isChecked():
             parts.append("spin")
         self._workers_lbl.setText("  \u00b7  ".join(parts))
@@ -860,6 +873,7 @@ class MainWindow(QMainWindow):
         p95 = lats[int(sn * 0.95)] / 1000
         p99 = lats[min(int(sn * 0.99), sn - 1)] / 1000
         mean = sum(lats) / sn / 1000
+        self._cur_mean = mean
         self._cur_p50 = p50
         self._cur_p99 = p99
 
@@ -881,7 +895,7 @@ class MainWindow(QMainWindow):
             self._rate_t = t
 
     def _on_tl(self):
-        self._timeline.add(self._cur_p50, self._cur_p99, poc_get())
+        self._timeline.add(self._cur_mean, self._cur_p50, self._cur_p99, poc_get())
 
     # ---- POC ----
 
