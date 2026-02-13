@@ -228,6 +228,28 @@ def poc_writable():
     return os.access(SYSCTL_POC_PATH, os.W_OK)
 
 # ---------------------------------------------------------------------------
+# Plugin loader
+# ---------------------------------------------------------------------------
+
+def _load_plugin():
+    """Load version-matched plugin from plugins/ directory."""
+    version = _sysfs_read("/sys/kernel/poc_selector/status/version")
+    if not version:
+        return None
+    plugin_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "plugins")
+    plugin_path = os.path.join(plugin_dir, f"{version}.py")
+    if not os.path.isfile(plugin_path):
+        return None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        f"poc_plugin_{version.replace('.', '_').replace('-', '_')}",
+        plugin_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return version, mod
+
+# ---------------------------------------------------------------------------
 # CPU info helpers
 # ---------------------------------------------------------------------------
 
@@ -869,6 +891,21 @@ class MainWindow(QMainWindow):
 
         ctrl2.addStretch()
         vbox.addLayout(ctrl2)
+
+        # ---- controls row 3 (plugin) ----
+        loaded = _load_plugin()
+        if loaded:
+            ver, plugin = loaded
+            if hasattr(plugin, "setup"):
+                ctrl3 = QHBoxLayout()
+                ver_lbl = QLabel(f"POC Selector v{ver}")
+                ver_lbl.setFont(QFont("monospace", 9))
+                ver_lbl.setStyleSheet("color: #8888aa;")
+                ctrl3.addWidget(ver_lbl)
+                ctrl3.addSpacing(15)
+                plugin.setup(ctrl3)
+                ctrl3.addStretch()
+                vbox.addLayout(ctrl3)
 
         # ---- CPU info ----
         cpu_lbl = QLabel(_cpu_info_text())
