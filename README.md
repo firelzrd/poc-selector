@@ -18,7 +18,7 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 ## Key Characteristics
 
 - **O(1) idle CPU discovery** via shared `u8[64]` flag arrays per LLC with lock-free `WRITE_ONCE` stores and multiply-and-shift reader aggregation
-- **6-level priority hierarchy** for cache locality optimization
+- **7-level priority hierarchy** for cache locality optimization
 - **Affinity-aware** — filters by task's `cpus_ptr` before search
 - **SIS_UTIL-aware** — respects CFS's overload detection before LLC-wide search
 - **Prefetch-optimized** — conditional cacheline prefetching with "fire early, use late" pipeline
@@ -77,33 +77,34 @@ if (!has_idle_core && cpus_share_cache(prev, target)) {
 
 **POC behavior**: Always executes idle core search first, falling back to SMT siblings only when all physical cores are busy.
 
-### 6-Level Priority Hierarchy
+### 7-Level Priority Hierarchy
 
-POC implements a strict 6-level priority hierarchy optimized for cache locality:
+POC implements a strict 7-level priority hierarchy optimized for cache locality:
 
 ```
 Phase 1: Early Return
-  Level 0: Saturation check     — No idle CPUs → return -1 (CFS fallback)
+  Level 0: Saturation check       — No idle CPUs → return -1 (CFS fallback)
 
 Phase 2: Sticky (prev affinity)
-  Level 1a: prev sticky          — Non-SMT: prev is idle → return prev (cache-hot)
-  Level 1b: prev/sibling sticky  — SMT: prev or sibling idle → return (before idle_cores read)
+  Level 1: prev sticky            — prev is idle → return prev (cache-hot)
+                                    (SMT: prev's core must also be idle)
+  Level 4: prev/sibling sticky    — SMT only: all cores busy, prev or sibling idle → return
 
 Phase 3: Core/CPU Search
-  SIS_UTIL gate                  — Respect CFS overload detection before LLC-wide search
-  Level 2: L2 cluster idle core  — Idle core within target's L2 cluster (round-robin)
-  Level 3: LLC-wide idle core    — Idle core anywhere in LLC (round-robin)
-  Level 4: L2 cluster CPU        — Any idle CPU within target's L2 cluster (round-robin)
-  Level 5: LLC-wide CPU          — Any idle CPU via round-robin
+  SIS_UTIL gate                   — Respect CFS overload detection before LLC-wide search
+  Level 2: L2 cluster idle core   — Idle core within target's L2 cluster (round-robin)
+  Level 3: LLC-wide idle core     — Idle core anywhere in LLC (round-robin)
+  Level 5: L2 cluster CPU         — Any idle CPU within target's L2 cluster (round-robin)
+  Level 6: LLC-wide CPU           — Any idle CPU via round-robin
 ```
 
-On non-SMT systems, Level 1b is skipped and Level 1a checks the prev idle CPU directly.
-On SMT systems, Level 1b runs before reading idle_cores, matching CFS's "prev idle → return prev" behavior.
-Levels 2-3 search the idle-core bitmap; levels 4-5 search the idle-CPU bitmap (fallback when no full cores are free).
+On non-SMT systems, Level 1 checks the prev idle CPU directly. Levels 2-3, 4 are skipped.
+On SMT systems, Level 1 and Level 4 are mutually exclusive: Level 1 runs when idle cores exist, Level 4 runs when all cores are busy (and also checks SMT sibling).
+Levels 2-3 search the idle-core bitmap; levels 5-6 search the idle-CPU bitmap (fallback when no full cores are free).
 
 ### SIS_UTIL Gate
 
-Before the LLC-wide search (Levels 2-5), POC respects CFS's SIS_UTIL overload detection:
+Before the LLC-wide search (Levels 2-3, 5-6), POC respects CFS's SIS_UTIL overload detection:
 
 - **Gate 1**: `nr_idle_scan == 0` — LLC utilization exceeds ~85%, skip search
 - **Gate 2**: `E[hits] = idle × nr / total < 1` — Models CFS's budget-limited scan. If the expected number of idle hits in CFS's scan budget is less than 1, POC also bails out
@@ -363,12 +364,12 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 
 ```
 /sys/kernel/poc_selector/count/
-├── l1a               # Level 1a hits (prev sticky, non-SMT)
-├── l1b               # Level 1b hits (prev/sibling sticky, SMT)
+├── l1                # Level 1 hits (prev sticky)
 ├── l2                # Level 2 hits (idle core in L2 cluster)
 ├── l3                # Level 3 hits (idle core across LLC)
-├── l4                # Level 4 hits (idle CPU in L2 cluster)
-├── l5                # Level 5 hits (idle CPU across LLC)
+├── l4                # Level 4 hits (prev/sibling sticky, SMT)
+├── l5                # Level 5 hits (idle CPU in L2 cluster)
+├── l6                # Level 6 hits (idle CPU across LLC)
 ├── fallback          # Fallback hits (POC returned -1, CFS took over)
 └── reset             # Write 1 to reset all counters
 ```
