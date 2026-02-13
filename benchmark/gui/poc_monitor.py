@@ -15,6 +15,7 @@ Usage:
 
 import sys
 import os
+import re
 import time
 import ctypes
 import threading
@@ -216,8 +217,95 @@ def poc_set(val):
     except Exception:
         return False
 
+def poc_active():
+    try:
+        with open("/sys/kernel/poc_selector/status/active") as f:
+            return int(f.read().strip())
+    except Exception:
+        return -1
+
 def poc_writable():
     return os.access(SYSCTL_POC_PATH, os.W_OK)
+
+# ---------------------------------------------------------------------------
+# CPU info helpers
+# ---------------------------------------------------------------------------
+
+def _cpu_info():
+    """Gather CPU model, topology, and ISA feature info."""
+    info = {
+        "model": "unknown",
+        "cores": 0,
+        "threads": os.cpu_count() or 0,
+        "l2": "",
+        "l3": "",
+        "flags": [],
+    }
+    # Parse /proc/cpuinfo
+    try:
+        with open("/proc/cpuinfo") as f:
+            cpuinfo = f.read()
+        phys_ids = set()
+        core_ids = set()
+        for line in cpuinfo.splitlines():
+            if line.startswith("model name") and info["model"] == "unknown":
+                info["model"] = line.split(":", 1)[1].strip()
+            elif line.startswith("physical id"):
+                phys_ids.add(line.split(":", 1)[1].strip())
+            elif line.startswith("core id"):
+                core_ids.add(line.split(":", 1)[1].strip())
+        if core_ids:
+            info["cores"] = len(core_ids) * max(1, len(phys_ids))
+    except Exception:
+        pass
+    # L2/L3 cache from sysfs
+    for idx in range(10):
+        level = _sysfs_read(f"/sys/devices/system/cpu/cpu0/cache/index{idx}/level")
+        size = _sysfs_read(f"/sys/devices/system/cpu/cpu0/cache/index{idx}/size")
+        shared = _sysfs_read(
+            f"/sys/devices/system/cpu/cpu0/cache/index{idx}/shared_cpu_list")
+        if level is None:
+            break
+        desc = size or "?"
+        if shared:
+            ncpus = 0
+            for part in shared.split(","):
+                if "-" in part:
+                    lo, hi = part.split("-", 1)
+                    ncpus += int(hi) - int(lo) + 1
+                else:
+                    ncpus += 1
+            if ncpus > 1:
+                desc += f" (shared/{ncpus})"
+        if level == "2":
+            info["l2"] = desc
+        elif level == "3":
+            info["l3"] = desc
+    # HW acceleration from POC sysfs
+    hw_dir = "/sys/kernel/poc_selector/hw_accel"
+    try:
+        for name in sorted(os.listdir(hw_dir)):
+            val = _sysfs_read(os.path.join(hw_dir, name))
+            if val:
+                m = re.match(r"HW\s*\((.+)\)", val)
+                if m:
+                    info["flags"].append(m.group(1))
+    except Exception:
+        pass
+    return info
+
+def _cpu_info_text():
+    """Format CPU info as a single display string."""
+    ci = _cpu_info()
+    parts = [ci["model"]]
+    parts.append(f"{ci['cores']}C/{ci['threads']}T")
+    if ci["l2"]:
+        parts.append(f"L2: {ci['l2']}")
+    if ci["l3"]:
+        parts.append(f"L3: {ci['l3']}")
+    if ci["flags"]:
+        parts.append("HW: " + " ".join(ci["flags"]))
+    return "  \u00b7  ".join(parts)
 
 # ---------------------------------------------------------------------------
 # Worker thread
@@ -782,6 +870,12 @@ class MainWindow(QMainWindow):
         ctrl2.addStretch()
         vbox.addLayout(ctrl2)
 
+        # ---- CPU info ----
+        cpu_lbl = QLabel(_cpu_info_text())
+        cpu_lbl.setFont(QFont("monospace", 8))
+        cpu_lbl.setStyleSheet("color: #666688;")
+        vbox.addWidget(cpu_lbl)
+
         # ---- state ----
         self._workers = []
         self._queue = deque(maxlen=600_000)
@@ -1025,9 +1119,15 @@ class MainWindow(QMainWindow):
     def _refresh_poc(self):
         s = poc_get()
         if s == 1:
-            self._poc_lbl.setText("POC: ON")
-            self._poc_lbl.setStyleSheet(
-                "color: #00ff64; font-family: monospace;")
+            active = poc_active()
+            if active == 1:
+                self._poc_lbl.setText("POC: ON")
+                self._poc_lbl.setStyleSheet(
+                    "color: #00ff64; font-family: monospace;")
+            else:
+                self._poc_lbl.setText("POC: ON")
+                self._poc_lbl.setStyleSheet(
+                    "color: #ffcc00; font-family: monospace;")
         elif s == 0:
             self._poc_lbl.setText("POC: OFF")
             self._poc_lbl.setStyleSheet(
