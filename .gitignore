@@ -14,3 +14,4 @@ benchmark/rust/target/
 .DS_Store
 /benchmark/c/v2/poc_bench
 *.cpython-*.pyc
+/benchmark/c/v1/poc_bench
