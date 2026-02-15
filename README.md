@@ -347,7 +347,7 @@ Apply the patch to a Linux source tree:
 
 ```bash
 cd /path/to/linux-x.y.z
-git apply /path/to/poc-selector/patches/0001-x.y.z-poc-selector.patch
+git apply /path/to/poc-selector/patches/stable/0001-x.y.z-poc-selector.patch
 ```
 
 After building and booting the patched kernel, the feature is enabled by default.
