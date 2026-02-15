@@ -1,7 +1,7 @@
 # Piece-Of-Cake (POC) CPU Selector
 
-A kernel patch that accelerates idle CPU discovery using per-LLC shared flag arrays
-with lock-free stores and O(1) reader aggregation, replacing linear scanning.
+A kernel patch that accelerates idle CPU discovery using per-LLC atomic64_t bitmaps
+with lock-free reads and atomic RMW writes for O(1) idle CPU lookup with thundering herd elimination.
 
 <div align="center"><img width="256" height="224" alt="poc" src="https://github.com/user-attachments/assets/c9452565-3498-430b-9d87-706662956968" /></div>
 
@@ -17,38 +17,44 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 
 ## Key Characteristics
 
-- **O(1) idle CPU discovery** via shared `u8[64]` flag arrays per LLC with lock-free `WRITE_ONCE` stores and multiply-and-shift reader aggregation
+- **O(1) idle CPU discovery** via per-LLC `atomic64_t` bitmaps with single `atomic64_read` (MOV on x86) for reads
+- **Atomic CPU claiming** via `atomic64_fetch_andnot` eliminates thundering herd — concurrent wakeups never select the same idle CPU
 - **7-level priority hierarchy** for cache locality optimization
 - **Affinity-aware** — filters by task's `cpus_ptr` before search
-- **SIS_UTIL-aware** — respects CFS's overload detection before LLC-wide search
+- **RT/DL saturation avoidance** — when saturated, avoids enqueuing behind RT/DL tasks on target CPU
 - **Prefetch-optimized** — conditional cacheline prefetching with "fire early, use late" pipeline
 - **Zero-overhead when disabled** via static keys
-- **Supports up to 64 CPUs per LLC** (single 64-bit word after aggregation)
+- **Supports up to 64 CPUs per LLC** (single 64-bit word)
 
 ## Features
 
 - **Fast idle CPU search** — Bitmap-based O(1) lookup replaces O(n) linear scan
-- **Lock-free write path** — Plain `WRITE_ONCE` (MOV) with no LOCK prefix, no pipeline stall
-- **Static key binary dispatch** — 3-bit encoded chunk count eliminates loop overhead in reader aggregation
-- **BMI2 PEXT acceleration** — Single-instruction flag extraction on supported hardware (Intel, AMD Zen 3+)
+- **Atomic claiming** — `atomic64_fetch_andnot` claims the CPU and refreshes the snapshot in a single instruction, preventing thundering herd with automatic retry on contention
+- **Static key binary dispatch** — Runtime paths are patched to NOP/JMP at boot for zero dispatch overhead
+- **BMI2 PEXT acceleration** — Single-instruction flag extraction for PTSELECT on supported hardware (Intel, AMD Zen 3+)
 - **SMT contention avoidance** — Strict preference for idle physical cores over SMT siblings
 - **Cache hierarchy awareness** — L1 → L2 → L3 locality optimization
 
 ## How It Works
 
-POC Selector maintains **per-LLC `u8[64]` flag arrays** that track which CPUs (and which physical cores) are idle.
-Each array occupies exactly one cache line (64 bytes). Writers use plain `WRITE_ONCE` stores (no LOCK prefix),
-and readers aggregate the flags into a u64 bitmask via a multiply-and-shift trick in O(1).
+POC Selector maintains **per-LLC `atomic64_t` bitmaps** that track which CPUs (and which physical cores) are idle.
+Each bitmap is a single 64-bit word. Writers use `atomic64_or` / `atomic64_andnot` (LOCK'd on x86),
+and readers use `atomic64_read` (plain MOV on x86) for O(1) snapshot access.
 
-When the scheduler needs an idle CPU for task wakeup, it consults these bitmasks instead of scanning every CPU in the domain.
+When the scheduler needs an idle CPU for task wakeup, it consults these bitmaps instead of scanning every CPU in the domain.
+After selecting a CPU, the selector **atomically claims** it via `atomic64_fetch_andnot`, which simultaneously clears the
+CPU's bit and returns the old value. If the bit was already clear (another CPU claimed it first), the old value serves
+as a free refreshed snapshot for retry — no extra read needed.
 
 When the fast path cannot handle the request (LLC > 64 CPUs, asymmetric CPU capacity, etc.), the standard `select_idle_cpu()` takes over transparently.
 
 ### Key Properties
 
-- **Lock-free** — writers use `WRITE_ONCE` (plain MOV); no LOCK prefix, no atomic RMW
+- **Atomic claiming** — `atomic64_fetch_andnot` claims + refreshes in one instruction; no thundering herd
+- **Lock-free reads** — `atomic64_read` (plain MOV on x86-TSO) for idle state queries
 - **SMT-aware** — prefers idle physical cores over idle SMT siblings
 - **Affinity-aware** — intersects idle mask with task's `cpus_ptr` before any search
+- **RT/DL-aware** — on saturation, avoids placing CFS tasks behind RT/DL tasks on the target CPU
 - **Zero fairness impact** — only changes *where* a task is placed, not scheduling order
 - **Runtime toggle** — `sysctl kernel.sched_poc_selector` (0/1, default 1)
 
@@ -85,31 +91,27 @@ POC implements a strict 7-level priority hierarchy optimized for cache locality:
 Phase 1: Early Return
   Level 0: Saturation check       — No idle CPUs → return -1 (CFS fallback)
 
-Phase 2: Sticky (prev affinity)
-  Level 1: prev sticky            — prev is idle → return prev (cache-hot)
-                                    (SMT: prev's core must also be idle)
-  Level 4: prev/sibling sticky    — SMT only: all cores busy, prev or sibling idle → return
+Phase 2: Sticky (target affinity)
+  Level 1: target sticky           — target CPU is idle → claim it (cache-hot)
+                                    (SMT: target's core must also be idle)
+  Level 4: target/sibling sticky   — SMT only: target or sibling idle → claim it
 
 Phase 3: Core/CPU Search
-  SIS_UTIL gate                   — Respect CFS overload detection before LLC-wide search
-  Level 2: L2 cluster idle core   — Idle core within target's L2 cluster (round-robin)
-  Level 3: LLC-wide idle core     — Idle core anywhere in LLC (round-robin)
-  Level 5: L2 cluster CPU         — Any idle CPU within target's L2 cluster (round-robin)
-  Level 6: LLC-wide CPU           — Any idle CPU via round-robin
+  Level 2: L2 cluster idle core   — Idle core within target's L2 cluster (round-robin, claimed)
+  Level 3: LLC-wide idle core     — Idle core anywhere in LLC (round-robin, claimed with retry)
+  Level 5: L2 cluster CPU         — Any idle CPU within target's L2 cluster (round-robin, claimed)
+  Level 6: LLC-wide CPU           — Any idle CPU via round-robin (claimed with retry)
 ```
 
-On non-SMT systems, Level 1 checks the prev idle CPU directly. Levels 2-3, 4 are skipped.
-On SMT systems, Level 1 and Level 4 are mutually exclusive: Level 1 runs when idle cores exist, Level 4 runs when all cores are busy (and also checks SMT sibling).
+On non-SMT systems, Level 1 checks the target idle CPU directly. Level 4 is skipped.
+On SMT systems, Level 1 checks if target's core is idle. Level 4 runs when `sched_poc_prefer_idle_smt` is enabled or when all cores are busy (and also checks SMT sibling).
 Levels 2-3 search the idle-core bitmap; levels 5-6 search the idle-CPU bitmap (fallback when no full cores are free).
 
-### SIS_UTIL Gate
+All selections use atomic claiming (`atomic64_fetch_andnot`) to prevent thundering herd. On claim failure, the returned old value provides a free refreshed snapshot for retry (up to `POC_MAX_CLAIM_ATTEMPTS = 3`).
 
-Before the LLC-wide search (Levels 2-3, 5-6), POC respects CFS's SIS_UTIL overload detection:
+### RT/DL Saturation Avoidance
 
-- **Gate 1**: `nr_idle_scan == 0` — LLC utilization exceeds ~85%, skip search
-- **Gate 2**: `E[hits] = idle × nr / total < 1` — Models CFS's budget-limited scan. If the expected number of idle hits in CFS's scan budget is less than 1, POC also bails out
-
-When either gate triggers, POC returns -1 to let CFS handle the fallback path.
+When POC returns -1 (all CPUs are saturated or claim attempts exhausted), the scheduler checks whether the target CPU is currently running an RT or DL task. If so, it returns `prev` instead of `target` to avoid enqueuing a CFS task behind a higher-priority task that may not yield.
 
 ### Performance Trade-off Analysis
 
@@ -132,7 +134,7 @@ The "inversion phenomenon": POC's strict idle core priority may appear to cost m
 
 ### Task Wakeup (`select_idle_sibling`)
 
-The hottest path — called on every task wakeup. Replaces both `select_idle_smt()` and `select_idle_cpu()` with a single bitmap-based O(1) lookup.
+The hottest path — called on every task wakeup. POC runs before the `has_idle_core` test, replacing both `select_idle_smt()` and `select_idle_cpu()` with a single bitmap-based O(1) lookup with atomic claiming.
 
 ---
 
@@ -144,64 +146,43 @@ Prefetches are skipped when the data would be consumed in the very next instruct
 
 | # | Target | Placement | Cover (work between prefetch and load) | Waste |
 |---|--------|-----------|----------------------------------------|-------|
-| 1 | `poc_idle_cpus[64]` | Function entry | `poc_cpumask_to_u64()` computation | 0% — always needed |
-| 2 | `poc_idle_cores[64]` (SMT) | After affinity computation | `poc_read_idle_cpus()` + saturation check | Low — wasted only when fully saturated |
-| 3 | `poc_smt_mask[prev_bit]` (SMT) | After affinity computation | `poc_read_idle_cpus()` + saturation check | Low — wasted when prev not local or fully saturated |
-| 4 | `poc_cluster_mask[target_bit]` | Start of cluster/RR block | Seed computation (per-CPU RMW + MUL) | 0% on non-cluster (static branch NOP) |
+| 1 | `poc_idle_cpus_mask` | Function entry | `poc_cpumask_to_u64()` computation | 0% — always needed |
+| 2 | `poc_idle_cores_mask` (SMT) | After affinity computation | `poc_read_idle_cpus()` + saturation check | Low — wasted only when fully saturated |
+| 3 | `poc_smt_mask[tgt_bit]` (SMT) | After affinity computation | `poc_read_idle_cpus()` + saturation check | Low — wasted when target not local or fully saturated |
+| 4 | `poc_cluster_mask[tgt_bit]` | Start of cluster/RR block | Seed computation (per-CPU RMW + MUL) | 0% on non-cluster (static branch NOP) |
 
 ---
 
 ## POC Optimization Techniques
 
-### Shared Flag Arrays and Reader Aggregation
+### Atomic64 Bitmaps and Claiming
 
 ```c
-u8  poc_idle_cpus[64]  ____cacheline_aligned;  // Logical CPUs
-u8  poc_idle_cores[64]  ____cacheline_aligned;  // Physical cores (SMT only)
+atomic64_t  poc_idle_cpus_mask  ____cacheline_aligned;  // Logical CPUs
+atomic64_t  poc_idle_cores_mask ____cacheline_aligned;  // Physical cores (SMT only)
 ```
 
 **Write path** (idle transitions):
-- `WRITE_ONCE(sd_share->poc_idle_cpus[bit], state ? 1 : 0)` — plain MOV, no LOCK prefix
-- No pipeline stall, no store buffer drain
-- `smp_wmb()` for SMT core flag ordering — on x86 TSO: compiler barrier only (0 cycles); on ARM64: `dmb ishst`
+- `atomic64_or(bit_mask, &sd_share->poc_idle_cpus_mask)` — set idle (LOCK OR on x86)
+- `atomic64_andnot(bit_mask, &sd_share->poc_idle_cpus_mask)` — set busy (LOCK AND NOT on x86)
+- `smp_mb__after_atomic()` for SMT core flag ordering — on x86 TSO: LOCK'd ops provide full fence so this is a compiler barrier (~0 cycles); on ARM64: `dmb ish`
 
-**Read path** (flag aggregation via `poc_flags_to_u64`):
-- Converts `u8[64]` flag array to `u64` bitmask using multiply-and-shift trick (or PEXT on BMI2)
-- Static key binary dispatch eliminates loop overhead — 3 static keys encode chunk count as 3-bit binary, dispatching to the exact number of operations needed
+**Read path** (idle state query):
+- `atomic64_read(&sd_share->poc_idle_cpus_mask)` — single MOV on x86-TSO, O(1)
+- Masked by `poc_llc_members` to exclude non-existent CPUs
+
+**Claim path** (thundering herd elimination):
+- `atomic64_fetch_andnot(bit_mask, &poc_idle_cpus_mask)` — atomically clears the target bit and returns the old value
+- If old value had the bit set: claim succeeded (we got it)
+- If old value had the bit clear: someone else claimed it first (no side effect); old value serves as free refreshed snapshot for retry
+- Up to `POC_MAX_CLAIM_ATTEMPTS = 3` retries before falling back to CFS
 
 **Cacheline layout** — hot/cold separation:
-- Hot write path (`poc_idle_cpus`, `poc_idle_cores`): each on its own aligned cache line
+- Hot write path (`poc_idle_cpus_mask`, `poc_idle_cores_mask`): each on its own aligned cache line
 - Read-only lookup tables (`poc_cluster_mask`, `poc_smt_mask`): separate aligned cache lines, written once at init
-- Prevents false sharing between write-hot flags and read-only tables
-
-### Static Key Binary Dispatch (`poc_flags_to_u64`)
-
-Three static keys (`poc_chunks_bit[2:0]`) encode `ceil(nr_cpus / 8) - 1` as a 3-bit value, set at boot.
-Nested `static_branch_unlikely` calls form a binary search tree that dispatches to 1 of 8 fully-unrolled paths:
-
-```
-bit2=0, bit1=0, bit0=0 → 1 chunk  (≤8 CPUs)
-bit2=0, bit1=0, bit0=1 → 2 chunks (9-16 CPUs)
-bit2=0, bit1=1, bit0=0 → 3 chunks (17-24 CPUs)
-  ...
-bit2=1, bit1=1, bit0=1 → 8 chunks (57-64 CPUs)
-```
-
-Each static branch is patched to NOP or JMP at boot — zero runtime dispatch cost.
-Only the exact number of multiply-and-shift (or PEXT) operations are executed.
+- Prevents false sharing between write-hot bitmaps and read-only tables
 
 ### Bit Manipulation Primitives
-
-#### POC_CHUNK (Flag-to-Bit Conversion)
-
-Two-tier implementation for each 8-byte chunk of the flag array:
-
-| Tier | Platform | Implementation | Per-Chunk Latency |
-|------|----------|----------------|-------------------|
-| 1 | x86-64 + BMI2 (excl. Zen 1/2) | PEXT + SHL | ~3 cycles |
-| 2 | Fallback | AND + MUL + SHR + SHL | ~5 cycles |
-
-**Note**: AMD Zen 1/2 excluded from PEXT path due to slow microcode implementation (~18 cycles).
 
 #### POC_CTZ64 (Count Trailing Zeros)
 
@@ -257,10 +238,8 @@ Maps [0, 2^32) → [0, range) without division using Lemire's fastrange algorith
 |-----|---------|---------|
 | `sched_poc_enabled` | true | Master POC on/off |
 | `sched_poc_l2_cluster_search` | true | L2 cluster search |
+| `sched_poc_prefer_idle_smt` | true | Level 4 SMT target/sibling search regardless of core_mask |
 | `sched_poc_aligned` | true | Fast cpumask conversion (disabled if any LLC base is non-64-aligned) |
-| `poc_chunks_bit2` | false | Binary dispatch bit 2 (chunks > 4) |
-| `poc_chunks_bit1` | false | Binary dispatch bit 1 |
-| `poc_chunks_bit0` | false | Binary dispatch bit 0 |
 | `sched_poc_count_enabled` | false | Debug counter collection |
 | `sched_cluster_active` | auto | Cluster topology detection |
 
@@ -290,7 +269,7 @@ seed = __this_cpu_inc_return(poc_rr_counter) * POC_HASH_MULT;
 
 | Mask | Purpose | Lookup Complexity |
 |------|---------|-------------------|
-| `poc_smt_mask[bit]` | SMT sibling mask per CPU (excl. self) | O(1) |
+| `poc_smt_mask[bit]` | SMT sibling mask per CPU (incl. self) | O(1) |
 | `poc_cluster_mask[bit]` | L2 cluster mask per CPU (excl. self) | O(1) |
 
 - Computed at boot time in topology.c
@@ -319,7 +298,7 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 
 - **Kernel**: Linux kernel built with `CONFIG_SCHED_POC_SELECTOR=y` (default)
 - **SMP**: Requires `CONFIG_SMP` (multi-processor kernel)
-- **Max 64 logical CPUs per LLC**: The flag array covers up to 64 CPUs per Last-Level Cache domain, aggregated into a single u64 via multiply-and-shift
+- **Max 64 logical CPUs per LLC**: The bitmap covers up to 64 CPUs per Last-Level Cache domain as a single atomic64_t
 - **Symmetric CPU capacity only**: Disabled on big.LITTLE / hybrid architectures (`sched_asym_cpucap_active`)
 - **Graceful fallback**: When the LLC contains more than 64 CPUs, the system has asymmetric CPU capacity, or no idle CPUs exist in the LLC, the selector transparently falls back to the standard `select_idle_cpu()` — no error, no performance penalty beyond losing the fast path
 - **Runtime toggle**: Can be disabled at runtime via `sysctl kernel.sched_poc_selector=0`
@@ -334,6 +313,7 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 |-----------|---------|-------------|
 | `kernel.sched_poc_selector` | 1 | Enable/disable POC selector |
 | `kernel.sched_poc_l2_cluster_search` | 1 | Enable/disable L2 cluster search |
+| `kernel.sched_poc_prefer_idle_smt` | 1 | Enable/disable Level 4 SMT target/sibling search regardless of core_mask |
 | `kernel.sched_poc_count` | 0 | Enable/disable per-level hit counter collection |
 
 ---
@@ -356,7 +336,6 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 /sys/kernel/poc_selector/hw_accel/
 ├── ctz               # CTZ implementation in use (e.g. "HW (TZCNT)")
 ├── ptselect          # PTSelect implementation in use (e.g. "HW (PDEP)")
-├── chunk             # Chunk aggregation in use (e.g. "HW (PEXT)" or "SW (MUL)")
 └── popcnt            # POPCNT implementation in use (e.g. "HW (POPCNT)")
 ```
 
@@ -364,13 +343,14 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 
 ```
 /sys/kernel/poc_selector/count/
-├── l1                # Level 1 hits (prev sticky)
+├── l1                # Level 1 hits (target sticky)
 ├── l2                # Level 2 hits (idle core in L2 cluster)
 ├── l3                # Level 3 hits (idle core across LLC)
-├── l4                # Level 4 hits (prev/sibling sticky, SMT)
+├── l4                # Level 4 hits (target/sibling sticky, SMT)
 ├── l5                # Level 5 hits (idle CPU in L2 cluster)
 ├── l6                # Level 6 hits (idle CPU across LLC)
 ├── fallback          # Fallback hits (POC returned -1, CFS took over)
+├── claim_fail        # Claim failures (atomic claim retry exhausted)
 └── reset             # Write 1 to reset all counters
 ```
 
