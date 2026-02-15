@@ -1,18 +1,17 @@
-From 8a14155781019ad6447d2b3566bb316048e7ce42 Mon Sep 17 00:00:00 2001
+From 3e296a05de859a3990e55f6eed75cc3c6ded98e2 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 16 Feb 2026 05:39:59 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v2.0.0-rc7
+Date: Mon, 16 Feb 2026 06:40:47 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v2.0.0
 
 ---
  include/linux/sched/topology.h |  33 +-
  init/Kconfig                   |  13 +
- kernel/sched/core.c            |   5 +
- kernel/sched/fair.c            |  36 +-
- kernel/sched/idle.c            |   5 +
- kernel/sched/poc_selector.c    | 968 +++++++++++++++++++++++++++++++++
- kernel/sched/sched.h           |  99 ++++
+ kernel/sched/fair.c            |  28 +-
+ kernel/sched/idle.c            |  10 +
+ kernel/sched/poc_selector.c    | 927 +++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h           |  98 ++++
  kernel/sched/topology.c        | 137 +++++
- 8 files changed, 1293 insertions(+), 3 deletions(-)
+ 7 files changed, 1243 insertions(+), 3 deletions(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
@@ -83,39 +82,11 @@ index cab3ad28ca..991fe7f8a4 100644
  config RELAY
  	bool "Kernel->user space relay support (formerly relayfs)"
  	select IRQ_WORK
-diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index f754a60de8..3937bcce88 100644
---- a/kernel/sched/core.c
-+++ b/kernel/sched/core.c
-@@ -2132,6 +2132,11 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
- 		sched_mm_cid_migrate_to(rq, p);
- 
- 	enqueue_task(rq, p, flags);
-+#ifdef CONFIG_SCHED_POC_SELECTOR
-+	/* POC: on idle→busy transition, update flag immediately */
-+	if (rq->nr_running == 1)
-+		set_cpu_idle_state_poc(cpu_of(rq), 0);
-+#endif /* CONFIG_SCHED_POC_SELECTOR */
- 
- 	WRITE_ONCE(p->on_rq, TASK_ON_RQ_QUEUED);
- 	ASSERT_EXCLUSIVE_WRITER(p->on_rq);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 967ca52fb2..2d8497ec11 100644
+index 967ca52fb2..63c64fba82 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -7133,6 +7133,11 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
- 	}
- 
- 	sub_nr_running(rq, h_nr_queued);
-+#ifdef CONFIG_SCHED_POC_SELECTOR
-+	/* POC: on busy→idle transition, update flag early */
-+	if (rq->nr_running == 0)
-+		set_cpu_idle_state_poc(cpu_of(rq), 1);
-+#endif
- 
- 	/* balance early to pull high priority tasks */
- 	if (unlikely(!was_sched_idle && sched_idle_rq(rq)))
-@@ -7817,6 +7822,9 @@ static inline bool asym_fits_cpu(unsigned long util,
+@@ -7817,6 +7817,9 @@ static inline bool asym_fits_cpu(unsigned long util,
  	return true;
  }
  
@@ -125,7 +96,7 @@ index 967ca52fb2..2d8497ec11 100644
  /*
   * Try and locate an idle core/thread in the LLC cache domain.
   */
-@@ -7919,9 +7927,32 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+@@ -7919,9 +7922,29 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
  	if (!sd)
  		return target;
  
@@ -141,12 +112,9 @@ index 967ca52fb2..2d8497ec11 100644
 +			if (poc_cpu >= 0)
 +				return poc_cpu;
 +			/* POC saturation: avoid enqueuing behind RT/DL tasks */
-+			if (prev != target && rt_task(cpu_rq(target)->curr)) {
-+				if (!static_branch_unlikely(&sched_poc_rt_fallback))
-+					return prev;
-+			} else {
-+				goto not_found;
-+			}
++			if (prev != target && rt_task(cpu_rq(target)->curr))
++				return prev;
++			goto not_found;
 +		}
 +	}
 +	poc_count(POC_FALLBACK);
@@ -159,7 +127,7 @@ index 967ca52fb2..2d8497ec11 100644
  		if (!has_idle_core && cpus_share_cache(prev, target)) {
  			i = select_idle_smt(p, sd, prev);
  			if ((unsigned int)i < nr_cpumask_bits)
-@@ -7933,6 +7964,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+@@ -7933,6 +7956,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
  	if ((unsigned)i < nr_cpumask_bits)
  		return i;
  
@@ -170,7 +138,7 @@ index 967ca52fb2..2d8497ec11 100644
  	 * For cluster machines which have lower sharing cache like L2 or
  	 * LLC Tag, we tend to find an idle CPU in the target's cluster
 diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
-index c39b089d4f..c9784a81fb 100644
+index c39b089d4f..3fffa1a43f 100644
 --- a/kernel/sched/idle.c
 +++ b/kernel/sched/idle.c
 @@ -275,6 +275,11 @@ static void do_idle(void)
@@ -185,12 +153,24 @@ index c39b089d4f..c9784a81fb 100644
  	while (!need_resched()) {
  
  		/*
+@@ -332,6 +337,11 @@ static void do_idle(void)
+ 		arch_cpu_idle_exit();
+ 	}
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++	/* POC Selector: mark CPU as busy */
++	set_cpu_idle_state_poc(cpu, 0);
++#endif /* CONFIG_SCHED_POC_SELECTOR */
++
+ 	/*
+ 	 * Since we fell out of the loop above, we know TIF_NEED_RESCHED must
+ 	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..b44d2f9c16
+index 0000000000..2d055d4950
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,927 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -230,7 +210,7 @@ index 0000000000..b44d2f9c16
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "2.0.0-rc7"
++#define SCHED_POC_SELECTOR_VERSION  "2.0.0"
 +
 +/**************************************************************
 + * Static keys:
@@ -264,18 +244,6 @@ index 0000000000..b44d2f9c16
 + * Default: enabled.
 + */
 +DEFINE_STATIC_KEY_TRUE(sched_poc_prefer_idle_smt);
-+
-+/*
-+ * RT/DL CFS fallback control: sched_poc_rt_fallback
-+ * (sysctl kernel.sched_poc_rt_fallback)
-+ *
-+ * When disabled (default), if POC returns -1 (saturation) and the
-+ * target CPU is running an RT/DL task, return prev instead of target
-+ * to avoid enqueuing behind a higher-priority task.
-+ * When enabled, fall through to CFS standard select_idle_cpu() path
-+ * on saturation regardless of RT/DL state on the target CPU.
-+ */
-+DEFINE_STATIC_KEY_FALSE(sched_poc_rt_fallback);
 +
 +/*
 + * sched_poc_aligned: true when all LLCs have poc_cpu_base aligned to 64
@@ -827,28 +795,6 @@ index 0000000000..b44d2f9c16
 +	return ret;
 +}
 +
-+static int sched_poc_rt_fallback_sysctl_handler(const struct ctl_table *table,
-+					    int write, void *buffer,
-+					    size_t *lenp, loff_t *ppos)
-+{
-+	unsigned int val = static_branch_unlikely(&sched_poc_rt_fallback) ? 1 : 0;
-+	struct ctl_table tmp = {
-+		.data    = &val,
-+		.maxlen  = sizeof(val),
-+		.extra1  = SYSCTL_ZERO,
-+		.extra2  = SYSCTL_ONE,
-+	};
-+	int ret = proc_douintvec_minmax(&tmp, write, buffer, lenp, ppos);
-+
-+	if (!ret && write) {
-+		if (val)
-+			static_branch_enable(&sched_poc_rt_fallback);
-+		else
-+			static_branch_disable(&sched_poc_rt_fallback);
-+	}
-+	return ret;
-+}
-+
 +static int sched_poc_count_sysctl_handler(const struct ctl_table *table,
 +					  int write, void *buffer,
 +					  size_t *lenp, loff_t *ppos)
@@ -892,13 +838,6 @@ index 0000000000..b44d2f9c16
 +		.maxlen		= sizeof(unsigned int),
 +		.mode		= 0644,
 +		.proc_handler	= sched_poc_prefer_idle_smt_sysctl_handler,
-+	},
-+	{
-+		.procname	= "sched_poc_rt_fallback",
-+		.data		= NULL,
-+		.maxlen		= sizeof(unsigned int),
-+		.mode		= 0644,
-+		.proc_handler	= sched_poc_rt_fallback_sysctl_handler,
 +	},
 +	{
 +		.procname	= "sched_poc_count",
@@ -1160,16 +1099,15 @@ index 0000000000..b44d2f9c16
 +#endif /* CONFIG_SYSFS */
 +#endif /* CONFIG_SCHED_POC_SELECTOR */
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index adfb6e3409..91196a67b6 100644
+index adfb6e3409..ae7fec3397 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -3134,6 +3134,105 @@ extern void nohz_run_idle_balance(int cpu);
+@@ -3134,6 +3134,104 @@ extern void nohz_run_idle_balance(int cpu);
  static inline void nohz_run_idle_balance(int cpu) { }
  #endif
  
 +#ifdef CONFIG_SCHED_POC_SELECTOR
 +extern struct static_key_true sched_poc_enabled;
-+extern struct static_key_false sched_poc_rt_fallback;
 +extern struct static_key_true sched_poc_aligned;
 +extern void __set_cpu_idle_state_poc(int cpu, int state);
 +static __always_inline void set_cpu_idle_state_poc(int cpu, int state)
