@@ -1,7 +1,7 @@
 # Piece-Of-Cake (POC) CPU Selector
 
 A kernel patch that accelerates idle CPU discovery using per-LLC atomic64_t bitmaps
-with lock-free reads and atomic RMW writes for O(1) idle CPU lookup with thundering herd elimination.
+with lock-free reads and atomic RMW writes for O(1) idle CPU lookup.
 
 <div align="center"><img width="256" height="224" alt="poc" src="https://github.com/user-attachments/assets/c9452565-3498-430b-9d87-706662956968" /></div>
 
@@ -18,7 +18,6 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 ## Key Characteristics
 
 - **O(1) idle CPU discovery** via per-LLC `atomic64_t` bitmaps with single `atomic64_read` (MOV on x86) for reads
-- **Atomic CPU claiming** via `atomic64_fetch_andnot` eliminates thundering herd — concurrent wakeups never select the same idle CPU
 - **7-level priority hierarchy** for cache locality optimization
 - **Affinity-aware** — filters by task's `cpus_ptr` before search
 - **RT/DL saturation avoidance** — when saturated, avoids enqueuing behind RT/DL tasks on target CPU
@@ -29,7 +28,6 @@ POC Selector distills one specific insight from scx_cake — fast idle-CPU selec
 ## Features
 
 - **Fast idle CPU search** — Bitmap-based O(1) lookup replaces O(n) linear scan
-- **Atomic claiming** — `atomic64_fetch_andnot` claims the CPU and refreshes the snapshot in a single instruction, preventing thundering herd with automatic retry on contention
 - **Static key binary dispatch** — Runtime paths are patched to NOP/JMP at boot for zero dispatch overhead
 - **BMI2 PEXT acceleration** — Single-instruction flag extraction for PTSELECT on supported hardware (Intel, AMD Zen 3+)
 - **SMT contention avoidance** — Strict preference for idle physical cores over SMT siblings
@@ -42,15 +40,11 @@ Each bitmap is a single 64-bit word. Writers use `atomic64_or` / `atomic64_andno
 and readers use `atomic64_read` (plain MOV on x86) for O(1) snapshot access.
 
 When the scheduler needs an idle CPU for task wakeup, it consults these bitmaps instead of scanning every CPU in the domain.
-After selecting a CPU, the selector **atomically claims** it via `atomic64_fetch_andnot`, which simultaneously clears the
-CPU's bit and returns the old value. If the bit was already clear (another CPU claimed it first), the old value serves
-as a free refreshed snapshot for retry — no extra read needed.
 
 When the fast path cannot handle the request (LLC > 64 CPUs, asymmetric CPU capacity, etc.), the standard `select_idle_cpu()` takes over transparently.
 
 ### Key Properties
 
-- **Atomic claiming** — `atomic64_fetch_andnot` claims + refreshes in one instruction; no thundering herd
 - **Lock-free reads** — `atomic64_read` (plain MOV on x86-TSO) for idle state queries
 - **SMT-aware** — prefers idle physical cores over idle SMT siblings
 - **Affinity-aware** — intersects idle mask with task's `cpus_ptr` before any search
@@ -92,26 +86,24 @@ Phase 1: Early Return
   Level 0: Saturation check       — No idle CPUs → return -1 (CFS fallback)
 
 Phase 2: Sticky (target affinity)
-  Level 1: target sticky           — target CPU is idle → claim it (cache-hot)
+  Level 1: target sticky           — target CPU is idle → return it (cache-hot)
                                     (SMT: target's core must also be idle)
-  Level 4: target/sibling sticky   — SMT only: target or sibling idle → claim it
+  Level 4: target/sibling sticky   — SMT only: target or sibling idle → return it
 
 Phase 3: Core/CPU Search
-  Level 2: L2 cluster idle core   — Idle core within target's L2 cluster (round-robin, claimed)
-  Level 3: LLC-wide idle core     — Idle core anywhere in LLC (round-robin, claimed with retry)
-  Level 5: L2 cluster CPU         — Any idle CPU within target's L2 cluster (round-robin, claimed)
-  Level 6: LLC-wide CPU           — Any idle CPU via round-robin (claimed with retry)
+  Level 2: L2 cluster idle core   — Idle core within target's L2 cluster (round-robin)
+  Level 3: LLC-wide idle core     — Idle core anywhere in LLC (round-robin)
+  Level 5: L2 cluster CPU         — Any idle CPU within target's L2 cluster (round-robin)
+  Level 6: LLC-wide CPU           — Any idle CPU via round-robin
 ```
 
 On non-SMT systems, Level 1 checks the target idle CPU directly. Level 4 is skipped.
 On SMT systems, Level 1 checks if target's core is idle. Level 4 runs when `sched_poc_prefer_idle_smt` is enabled or when all cores are busy (and also checks SMT sibling).
 Levels 2-3 search the idle-core bitmap; levels 5-6 search the idle-CPU bitmap (fallback when no full cores are free).
 
-All selections use atomic claiming (`atomic64_fetch_andnot`) to prevent thundering herd. On claim failure, the returned old value provides a free refreshed snapshot for retry (up to `POC_MAX_CLAIM_ATTEMPTS = 3`).
-
 ### RT/DL Saturation Avoidance
 
-When POC returns -1 (all CPUs are saturated or claim attempts exhausted), the scheduler checks whether the target CPU is currently running an RT or DL task. If so, it returns `prev` instead of `target` to avoid enqueuing a CFS task behind a higher-priority task that may not yield.
+When POC returns -1 (no idle CPUs exist in the LLC), the scheduler checks whether the target CPU is currently running an RT or DL task. If so, it returns `prev` instead of `target` to avoid enqueuing a CFS task behind a higher-priority task that may not yield.
 
 ### Performance Trade-off Analysis
 
@@ -134,7 +126,7 @@ The "inversion phenomenon": POC's strict idle core priority may appear to cost m
 
 ### Task Wakeup (`select_idle_sibling`)
 
-The hottest path — called on every task wakeup. POC runs before the `has_idle_core` test, replacing both `select_idle_smt()` and `select_idle_cpu()` with a single bitmap-based O(1) lookup with atomic claiming.
+The hottest path — called on every task wakeup. POC runs before the `has_idle_core` test, replacing both `select_idle_smt()` and `select_idle_cpu()` with a single bitmap-based O(1) lookup.
 
 ---
 
@@ -155,7 +147,7 @@ Prefetches are skipped when the data would be consumed in the very next instruct
 
 ## POC Optimization Techniques
 
-### Atomic64 Bitmaps and Claiming
+### Atomic64 Bitmaps
 
 ```c
 atomic64_t  poc_idle_cpus_mask  ____cacheline_aligned;  // Logical CPUs
@@ -170,12 +162,6 @@ atomic64_t  poc_idle_cores_mask ____cacheline_aligned;  // Physical cores (SMT o
 **Read path** (idle state query):
 - `atomic64_read(&sd_share->poc_idle_cpus_mask)` — single MOV on x86-TSO, O(1)
 - Masked by `poc_llc_members` to exclude non-existent CPUs
-
-**Claim path** (thundering herd elimination):
-- `atomic64_fetch_andnot(bit_mask, &poc_idle_cpus_mask)` — atomically clears the target bit and returns the old value
-- If old value had the bit set: claim succeeded (we got it)
-- If old value had the bit clear: someone else claimed it first (no side effect); old value serves as free refreshed snapshot for retry
-- Up to `POC_MAX_CLAIM_ATTEMPTS = 3` retries before falling back to CFS
 
 **Cacheline layout** — hot/cold separation:
 - Hot write path (`poc_idle_cpus_mask`, `poc_idle_cores_mask`): each on its own aligned cache line
@@ -350,7 +336,6 @@ The `sched_poc_aligned` static key eliminates the branch at runtime.
 ├── l5                # Level 5 hits (idle CPU in L2 cluster)
 ├── l6                # Level 6 hits (idle CPU across LLC)
 ├── fallback          # Fallback hits (POC returned -1, CFS took over)
-├── claim_fail        # Claim failures (atomic claim retry exhausted)
 └── reset             # Write 1 to reset all counters
 ```
 

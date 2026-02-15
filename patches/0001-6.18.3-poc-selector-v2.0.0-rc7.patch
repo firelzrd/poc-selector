@@ -1,18 +1,18 @@
-From 13015e77fc750dad0b4bbd23642262c0eade3757 Mon Sep 17 00:00:00 2001
+From 8a14155781019ad6447d2b3566bb316048e7ce42 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 15 Feb 2026 10:51:52 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v2.0.0-rc6
+Date: Mon, 16 Feb 2026 05:39:59 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v2.0.0-rc7
 
 ---
- include/linux/sched/topology.h |   33 +-
- init/Kconfig                   |   13 +
- kernel/sched/core.c            |    5 +
- kernel/sched/fair.c            |   33 +-
- kernel/sched/idle.c            |    5 +
- kernel/sched/poc_selector.c    | 1118 ++++++++++++++++++++++++++++++++
- kernel/sched/sched.h           |   98 +++
- kernel/sched/topology.c        |  137 ++++
- 8 files changed, 1439 insertions(+), 3 deletions(-)
+ include/linux/sched/topology.h |  33 +-
+ init/Kconfig                   |  13 +
+ kernel/sched/core.c            |   5 +
+ kernel/sched/fair.c            |  36 +-
+ kernel/sched/idle.c            |   5 +
+ kernel/sched/poc_selector.c    | 968 +++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h           |  99 ++++
+ kernel/sched/topology.c        | 137 +++++
+ 8 files changed, 1293 insertions(+), 3 deletions(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
@@ -100,7 +100,7 @@ index f754a60de8..3937bcce88 100644
  	WRITE_ONCE(p->on_rq, TASK_ON_RQ_QUEUED);
  	ASSERT_EXCLUSIVE_WRITER(p->on_rq);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 967ca52fb2..caac8fd324 100644
+index 967ca52fb2..2d8497ec11 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -7133,6 +7133,11 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
@@ -125,7 +125,7 @@ index 967ca52fb2..caac8fd324 100644
  /*
   * Try and locate an idle core/thread in the LLC cache domain.
   */
-@@ -7919,9 +7927,29 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+@@ -7919,9 +7927,32 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
  	if (!sd)
  		return target;
  
@@ -141,9 +141,12 @@ index 967ca52fb2..caac8fd324 100644
 +			if (poc_cpu >= 0)
 +				return poc_cpu;
 +			/* POC saturation: avoid enqueuing behind RT/DL tasks */
-+			if (prev != target && rt_task(cpu_rq(target)->curr))
-+				return prev;
-+			goto not_found;
++			if (prev != target && rt_task(cpu_rq(target)->curr)) {
++				if (!static_branch_unlikely(&sched_poc_rt_fallback))
++					return prev;
++			} else {
++				goto not_found;
++			}
 +		}
 +	}
 +	poc_count(POC_FALLBACK);
@@ -156,7 +159,7 @@ index 967ca52fb2..caac8fd324 100644
  		if (!has_idle_core && cpus_share_cache(prev, target)) {
  			i = select_idle_smt(p, sd, prev);
  			if ((unsigned int)i < nr_cpumask_bits)
-@@ -7933,6 +7961,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+@@ -7933,6 +7964,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
  	if ((unsigned)i < nr_cpumask_bits)
  		return i;
  
@@ -184,10 +187,10 @@ index c39b089d4f..c9784a81fb 100644
  		/*
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..e2c881ae52
+index 0000000000..b44d2f9c16
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,1118 @@
+@@ -0,0 +1,968 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -227,7 +230,7 @@ index 0000000000..e2c881ae52
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "2.0.0-rc6"
++#define SCHED_POC_SELECTOR_VERSION  "2.0.0-rc7"
 +
 +/**************************************************************
 + * Static keys:
@@ -263,6 +266,18 @@ index 0000000000..e2c881ae52
 +DEFINE_STATIC_KEY_TRUE(sched_poc_prefer_idle_smt);
 +
 +/*
++ * RT/DL CFS fallback control: sched_poc_rt_fallback
++ * (sysctl kernel.sched_poc_rt_fallback)
++ *
++ * When disabled (default), if POC returns -1 (saturation) and the
++ * target CPU is running an RT/DL task, return prev instead of target
++ * to avoid enqueuing behind a higher-priority task.
++ * When enabled, fall through to CFS standard select_idle_cpu() path
++ * on saturation regardless of RT/DL state on the target CPU.
++ */
++DEFINE_STATIC_KEY_FALSE(sched_poc_rt_fallback);
++
++/*
 + * sched_poc_aligned: true when all LLCs have poc_cpu_base aligned to 64
 + *
 + * When true, cpumask-to-POC conversion is a simple word load (zero shift).
@@ -287,7 +302,6 @@ index 0000000000..e2c881ae52
 +	POC_LV5,	/* idle CPU in L2 cluster */
 +	POC_LV6,	/* idle CPU across LLC (RR) */
 +	POC_FALLBACK,	/* POC returned -1, CFS fallback */
-+	POC_CLAIM_FAIL,	/* atomic claim failed (retry exhausted) */
 +	POC_NR_LEVELS
 +};
 +
@@ -511,85 +525,18 @@ index 0000000000..e2c881ae52
 +		bool core_idle = state > 0 && is_idle_core_poc(cpu, sd_share);
 +
 +		u64 core_bitmask = 1ULL << core_bit;
++		u64 cores = (u64)atomic64_read(&sd_share->poc_idle_cores_mask);
 +
-+		if (core_idle)
-+			atomic64_or(core_bitmask, &sd_share->poc_idle_cores_mask);
-+		else
-+			atomic64_andnot(core_bitmask, &sd_share->poc_idle_cores_mask);
++		if (core_idle) {
++			if (!(cores & core_bitmask))
++				atomic64_or(core_bitmask, &sd_share->poc_idle_cores_mask);
++		} else {
++			if (cores & core_bitmask)
++				atomic64_andnot(core_bitmask, &sd_share->poc_idle_cores_mask);
++		}
 +	}
 +#endif /* CONFIG_SCHED_SMT */
 +}
-+
-+/**************************************************************
-+ * Atomic CPU claiming:
-+ */
-+
-+/*
-+ * POC_MAX_CLAIM_ATTEMPTS - Maximum claim attempts before giving up
-+ *
-+ * Each failed claim provides a free snapshot refresh via the old
-+ * value returned by atomic64_fetch_andnot. Three attempts balance
-+ * thoroughness against latency; exceeding this indicates extreme
-+ * contention where CFS fallback is more appropriate.
-+ */
-+#define POC_MAX_CLAIM_ATTEMPTS 3
-+
-+/*
-+ * poc_try_claim_cpu - Atomically claim an idle CPU by clearing its bit
-+ * @bit:      LLC-relative bit position of the CPU to claim
-+ * @sd_share: per-LLC shared data containing poc_idle_cpus_mask
-+ * @old_mask: [out] old value of poc_idle_cpus_mask before the attempt
-+ *
-+ * Uses atomic64_fetch_andnot to atomically clear the target bit.
-+ * If the bit was set in the old value, the claim succeeded.
-+ * If already clear, someone else claimed it first (no side effect).
-+ *
-+ * The returned @old_mask doubles as a refreshed snapshot on failure,
-+ * avoiding an extra atomic64_read.
-+ *
-+ * Returns: true if the CPU was successfully claimed, false otherwise.
-+ */
-+static __always_inline bool
-+poc_try_claim_cpu(int bit, struct sched_domain_shared *sd_share, u64 *old_mask)
-+{
-+	u64 bit_mask = 1ULL << bit;
-+
-+	*old_mask = (u64)atomic64_fetch_andnot((s64)bit_mask,
-+					       &sd_share->poc_idle_cpus_mask);
-+	return !!(*old_mask & bit_mask);
-+}
-+
-+#ifdef CONFIG_SCHED_SMT
-+/*
-+ * poc_update_core_mask_after_claim - Update core idle mask after claiming a CPU
-+ * @bit:      LLC-relative bit position of the claimed CPU
-+ * @old_cpus: old poc_idle_cpus_mask value (before our claim)
-+ * @sd_share: per-LLC shared data
-+ *
-+ * After claiming a CPU (clearing its bit from poc_idle_cpus_mask),
-+ * check if the core is still fully idle.  The "new" cpu mask is
-+ * (old_cpus & ~(1ULL << bit)).  If any sibling is now not idle,
-+ * clear the core bit from poc_idle_cores_mask to prevent stale
-+ * core-idle information from misleading subsequent wakeups.
-+ */
-+static __always_inline void
-+poc_update_core_mask_after_claim(int bit, u64 old_cpus,
-+				struct sched_domain_shared *sd_share)
-+{
-+	if (!sched_smt_active())
-+		return;
-+
-+	u64 new_cpus = old_cpus & ~(1ULL << bit);
-+	u64 core_siblings = sd_share->poc_smt_mask[bit];
-+
-+	if ((new_cpus & core_siblings) != core_siblings) {
-+		int core_bit = POC_CTZ64(core_siblings);
-+
-+		atomic64_andnot((s64)(1ULL << core_bit),
-+				&sd_share->poc_idle_cores_mask);
-+	}
-+}
-+#endif /* CONFIG_SCHED_SMT */
 +
 +/**************************************************************
 + * Idle CPU selection helpers:
@@ -639,88 +586,6 @@ index 0000000000..e2c881ae52
 +	return -1;
 +}
 +
-+/*
-+ * poc_select_rr_claimed - Select and claim an idle CPU with retry
-+ * @mask:      initial idle bitmask (already affinity-filtered)
-+ * @base:      poc_cpu_base
-+ * @sd_share:  per-LLC shared data
-+ * @affinity:  affinity mask (u64) for re-filtering refreshed snapshots
-+ * @seed:      initial RR seed
-+ *
-+ * Attempts to atomically claim an idle CPU up to POC_MAX_CLAIM_ATTEMPTS
-+ * times.  On each failure, the old value from atomic64_fetch_andnot
-+ * provides a free refreshed snapshot of poc_idle_cpus_mask.
-+ *
-+ * Returns: claimed CPU number if successful, -1 if all attempts failed.
-+ */
-+static __always_inline int
-+poc_select_rr_claimed(u64 mask, int base,
-+		      struct sched_domain_shared *sd_share,
-+		      u64 affinity, unsigned int seed)
-+{
-+	int attempts = POC_MAX_CLAIM_ATTEMPTS;
-+
-+	while (mask && attempts--) {
-+		int cpu = poc_select_rr(mask, base, seed);
-+		int bit = cpu - base;
-+		u64 old_cpus;
-+
-+		if (poc_try_claim_cpu(bit, sd_share, &old_cpus)) {
-+#ifdef CONFIG_SCHED_SMT
-+			poc_update_core_mask_after_claim(bit, old_cpus, sd_share);
-+#endif
-+			return cpu;
-+		}
-+
-+		/* Refresh mask from the atomic's old value */
-+		mask = old_cpus & sd_share->poc_llc_members & affinity;
-+		seed = seed * POC_HASH_MULT + 1;
-+	}
-+
-+	return -1;
-+}
-+
-+/*
-+ * poc_cluster_search_claimed - Search and claim within L2 cluster
-+ * @mask:      idle bitmask snapshot
-+ * @sd_share:  per-LLC shared data
-+ * @tgt_bit:   target CPU's LLC-relative bit position
-+ * @base:      poc_cpu_base
-+ * @affinity:  u64 affinity mask
-+ * @seed:      RR seed
-+ *
-+ * Intersects mask with cluster mask and attempts to claim.
-+ * Single attempt only -- if cluster contention is high, the caller
-+ * should fall through to LLC-wide search which has retry logic.
-+ *
-+ * Returns: claimed CPU number, or -1.
-+ */
-+static __always_inline int
-+poc_cluster_search_claimed(u64 mask, struct sched_domain_shared *sd_share,
-+			   int tgt_bit, int base,
-+			   u64 affinity, unsigned int seed)
-+{
-+	u64 cls_mask, cls_idle;
-+
-+	cls_mask = sd_share->poc_cluster_mask[tgt_bit];
-+	cls_idle = mask & cls_mask;
-+
-+	if (cls_idle) {
-+		int cpu = poc_select_rr(cls_idle, base, seed);
-+		int bit = cpu - base;
-+		u64 old_cpus;
-+
-+		if (poc_try_claim_cpu(bit, sd_share, &old_cpus)) {
-+#ifdef CONFIG_SCHED_SMT
-+			poc_update_core_mask_after_claim(bit, old_cpus, sd_share);
-+#endif
-+			return cpu;
-+		}
-+	}
-+
-+	return -1;
-+}
-+
 +#ifdef CONFIG_SCHED_SMT
 +/*
 + * poc_find_idle_smt_sibling - Find an idle CPU among target and its SMT siblings
@@ -765,22 +630,21 @@ index 0000000000..e2c881ae52
 + * @sd_share: per-LLC shared data (caller provides; never NULL)
 + * @allowed: task's cpumask (p->cpus_ptr) for affinity filtering
 + *
-+ * Idle CPU selection using atomic64_t bitmaps with atomic claiming:
++ * Idle CPU selection using atomic64_t bitmaps:
 + *
 + *   Level 0: Saturation check -- no idle CPUs → return -1 (CFS fallback)
-+ *   Level 1: Target CPU check (with atomic claim)
-+ *   Level 2: Idle core in L2 cluster (RR PTSELECT, claimed)
-+ *   Level 3: Idle core across LLC (RR PTSELECT, claimed with retry)
-+ *   Level 4: Target/sibling (SMT only, with atomic claim)
-+ *   Level 5: Idle CPU in L2 cluster (RR PTSELECT, claimed)
-+ *   Level 6: Idle CPU across LLC (RR PTSELECT, claimed with retry)
++ *   Level 1: Target CPU check
++ *   Level 2: Idle core in L2 cluster (RR PTSELECT)
++ *   Level 3: Idle core across LLC (RR PTSELECT)
++ *   Level 4: Target/sibling (SMT only, all cores busy)
++ *   Level 5: Idle CPU in L2 cluster (RR PTSELECT)
++ *   Level 6: Idle CPU across LLC (RR PTSELECT)
 + *
-+ * Each selection atomically clears the chosen CPU's bit in
-+ * poc_idle_cpus_mask via atomic64_fetch_andnot, preventing
-+ * concurrent wakeups from selecting the same idle CPU
-+ * (thundering herd elimination).  Failed claims provide a free
-+ * refreshed snapshot for retry.  The bit self-heals when the
-+ * CPU's idle state is updated via set_cpu_idle_state_poc().
++ * On SMT, Level 4 checks target/sibling idle when all cores are busy.
++ * Levels 2-3 search the idle-core bitmap; levels 5-6 search
++ * the idle-CPU bitmap (fallback when no full cores are free).
++ * Non-SMT skips directly to levels 1-3 (core = CPU).
++ * All masks are filtered by @allowed (affinity) before search.
 + *
 + * Returns: idle CPU number if found, -1 otherwise
 + */
@@ -814,21 +678,11 @@ index 0000000000..e2c881ae52
 +		u64 core_mask = poc_read_idle_cores(sd_share) & affinity;
 +
 +		if (core_mask) {
-+			/* Level 1: target CPU's core is idle → claim it */
++			/* Level 1: target CPU's core is idle → return it */
 +			u64 tgt_core = sd_share->poc_smt_mask[tgt_bit];
 +			if (core_mask & tgt_core) {
-+				u64 old_cpus;
-+
-+				if (poc_try_claim_cpu(tgt_bit, sd_share, &old_cpus)) {
-+					poc_update_core_mask_after_claim( tgt_bit, old_cpus, sd_share);
-+					poc_count(POC_LV1);
-+					return target;
-+				}
-+				/* Claim failed: refresh masks */
-+				cpu_mask = old_cpus & sd_share->poc_llc_members & affinity;
-+				if (!cpu_mask)
-+					return -1;
-+				core_mask = poc_read_idle_cores(sd_share) & affinity;
++				poc_count(POC_LV1);
++				return target;
 +			}
 +		}
 +
@@ -837,19 +691,8 @@ index 0000000000..e2c881ae52
 +			int smt_cpu = poc_find_idle_smt_sibling(
 +				target, cpu_mask, base, sd_share->poc_smt_mask);
 +			if (smt_cpu >= 0) {
-+				int smt_bit = smt_cpu - base;
-+				u64 old_cpus;
-+
-+				if (poc_try_claim_cpu(smt_bit, sd_share, &old_cpus)) {
-+					poc_update_core_mask_after_claim( smt_bit, old_cpus, sd_share);
-+					poc_count(POC_LV4);
-+					return smt_cpu;
-+				}
-+				/* Claim failed: refresh masks */
-+				cpu_mask = old_cpus & sd_share->poc_llc_members & affinity;
-+				if (!cpu_mask)
-+					return -1;
-+				core_mask = poc_read_idle_cores(sd_share) & affinity;
++				poc_count(POC_LV4);
++				return smt_cpu;
 +			}
 +		}
 +
@@ -860,18 +703,10 @@ index 0000000000..e2c881ae52
 +	}
 +	else
 +#endif
-+	/* Level 1: target CPU is idle → claim it (non-SMT) */
++	/* Level 1: target CPU is idle → return (non-SMT) */
 +	if (cpu_mask & (1ULL << tgt_bit)) {
-+		u64 old_cpus;
-+
-+		if (poc_try_claim_cpu(tgt_bit, sd_share, &old_cpus)) {
-+			poc_count(POC_LV1);
-+			return target;
-+		}
-+		/* Claim failed: refresh cpu_mask */
-+		cpu_mask = old_cpus & sd_share->poc_llc_members & affinity;
-+		if (!cpu_mask)
-+			return -1;
++		poc_count(POC_LV1);
++		return target;
 +	}
 +
 +	{
@@ -886,26 +721,17 @@ index 0000000000..e2c881ae52
 +		if (static_branch_likely(&sched_poc_l2_cluster_search)
 +				&& static_branch_unlikely(&sched_cluster_active)
 +				&& sd_share->poc_cluster_valid) {
-+			int cpu = poc_cluster_search_claimed(
-+				cpu_mask, sd_share, tgt_bit, base, affinity, seed);
++			int cpu = poc_cluster_search(cpu_mask, sd_share,
++						     tgt_bit, base, seed);
 +			if (cpu >= 0) {
 +				poc_count(POC_LV2 + level_offset);
 +				return cpu;
 +			}
 +		}
 +
-+		/* Level 3/6: idle core/cpu across LLC via RR (with retry) */
-+		{
-+			int cpu = poc_select_rr_claimed(
-+				cpu_mask, base, sd_share, affinity, seed);
-+			if (cpu >= 0) {
-+				poc_count(POC_LV3 + level_offset);
-+				return cpu;
-+			}
-+		}
-+
-+		poc_count(POC_CLAIM_FAIL);
-+		return -1;
++		/* Level 3/6: idle core/cpu across LLC via RR */
++		poc_count(POC_LV3 + level_offset);
++		return poc_select_rr(cpu_mask, base, seed);
 +	}
 +}
 +
@@ -1001,6 +827,28 @@ index 0000000000..e2c881ae52
 +	return ret;
 +}
 +
++static int sched_poc_rt_fallback_sysctl_handler(const struct ctl_table *table,
++					    int write, void *buffer,
++					    size_t *lenp, loff_t *ppos)
++{
++	unsigned int val = static_branch_unlikely(&sched_poc_rt_fallback) ? 1 : 0;
++	struct ctl_table tmp = {
++		.data    = &val,
++		.maxlen  = sizeof(val),
++		.extra1  = SYSCTL_ZERO,
++		.extra2  = SYSCTL_ONE,
++	};
++	int ret = proc_douintvec_minmax(&tmp, write, buffer, lenp, ppos);
++
++	if (!ret && write) {
++		if (val)
++			static_branch_enable(&sched_poc_rt_fallback);
++		else
++			static_branch_disable(&sched_poc_rt_fallback);
++	}
++	return ret;
++}
++
 +static int sched_poc_count_sysctl_handler(const struct ctl_table *table,
 +					  int write, void *buffer,
 +					  size_t *lenp, loff_t *ppos)
@@ -1044,6 +892,13 @@ index 0000000000..e2c881ae52
 +		.maxlen		= sizeof(unsigned int),
 +		.mode		= 0644,
 +		.proc_handler	= sched_poc_prefer_idle_smt_sysctl_handler,
++	},
++	{
++		.procname	= "sched_poc_rt_fallback",
++		.data		= NULL,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= sched_poc_rt_fallback_sysctl_handler,
 +	},
 +	{
 +		.procname	= "sched_poc_count",
@@ -1234,7 +1089,6 @@ index 0000000000..e2c881ae52
 +DEFINE_POC_COUNT_ATTR(l5, POC_LV5);
 +DEFINE_POC_COUNT_ATTR(l6, POC_LV6);
 +DEFINE_POC_COUNT_ATTR(fallback, POC_FALLBACK);
-+DEFINE_POC_COUNT_ATTR(claim_fail, POC_CLAIM_FAIL);
 +
 +static ssize_t poc_count_reset_store(struct kobject *kobj,
 +		struct kobj_attribute *attr,
@@ -1261,7 +1115,6 @@ index 0000000000..e2c881ae52
 +	&poc_count_l5_attr.attr,
 +	&poc_count_l6_attr.attr,
 +	&poc_count_fallback_attr.attr,
-+	&poc_count_claim_fail_attr.attr,
 +	&poc_count_reset_attr.attr,
 +	NULL,
 +};
@@ -1307,15 +1160,16 @@ index 0000000000..e2c881ae52
 +#endif /* CONFIG_SYSFS */
 +#endif /* CONFIG_SCHED_POC_SELECTOR */
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index adfb6e3409..ae7fec3397 100644
+index adfb6e3409..91196a67b6 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -3134,6 +3134,104 @@ extern void nohz_run_idle_balance(int cpu);
+@@ -3134,6 +3134,105 @@ extern void nohz_run_idle_balance(int cpu);
  static inline void nohz_run_idle_balance(int cpu) { }
  #endif
  
 +#ifdef CONFIG_SCHED_POC_SELECTOR
 +extern struct static_key_true sched_poc_enabled;
++extern struct static_key_false sched_poc_rt_fallback;
 +extern struct static_key_true sched_poc_aligned;
 +extern void __set_cpu_idle_state_poc(int cpu, int state);
 +static __always_inline void set_cpu_idle_state_poc(int cpu, int state)
