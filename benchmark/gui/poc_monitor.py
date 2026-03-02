@@ -106,18 +106,43 @@ except Exception:
 
 _spin_until_ns = None
 
+_nanosleep_ns = None
+
 def _build_spin_lib():
-    """Compile a tiny C helper for GIL-free spin-wait."""
+    """Compile tiny C helpers for GIL-free latency measurement.
+
+    spin_until_ns:  busy-wait until deadline, return actual completion time.
+    nanosleep_ns:   clock_nanosleep + immediate clock_gettime, return wakeup
+                    time measured *inside* C (before GIL re-acquire).
+    Both return int64_t nanoseconds (CLOCK_MONOTONIC) so the caller can
+    compute latency without any GIL-induced measurement skew.
+    """
     src = r"""
 #include <time.h>
 #include <stdint.h>
-void spin_until_ns(int64_t deadline_ns) {
+
+static inline int64_t _now_ns(void) {
     struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+int64_t spin_until_ns(int64_t deadline_ns) {
+    int64_t now;
     for (;;) {
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        if ((int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec >= deadline_ns)
-            return;
+        now = _now_ns();
+        if (now >= deadline_ns)
+            return now;
     }
+}
+
+int64_t nanosleep_ns(int64_t sleep_ns) {
+    struct timespec req = {
+        .tv_sec  = sleep_ns / 1000000000LL,
+        .tv_nsec = sleep_ns % 1000000000LL,
+    };
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &req, NULL);
+    return _now_ns();
 }
 """
     d = tempfile.mkdtemp(prefix="poc_spin_")
@@ -130,14 +155,16 @@ void spin_until_ns(int64_t deadline_ns) {
         check=True, capture_output=True,
     )
     lib = ctypes.CDLL(lib_path)
-    lib.spin_until_ns.restype = None
+    lib.spin_until_ns.restype = ctypes.c_int64
     lib.spin_until_ns.argtypes = [ctypes.c_int64]
-    return lib.spin_until_ns
+    lib.nanosleep_ns.restype = ctypes.c_int64
+    lib.nanosleep_ns.argtypes = [ctypes.c_int64]
+    return lib.spin_until_ns, lib.nanosleep_ns
 
 try:
-    _spin_until_ns = _build_spin_lib()
+    _spin_until_ns, _nanosleep_ns = _build_spin_lib()
 except Exception:
-    pass  # fall back to Python spin loop
+    pass  # fall back to Python paths
 
 # ---------------------------------------------------------------------------
 # cpuidle C-state helpers
@@ -354,7 +381,8 @@ class LatencyWorker(threading.Thread):
         gettime = time.clock_gettime_ns
         CLK = time.CLOCK_MONOTONIC
         slp = time.sleep
-        c_spin = _spin_until_ns  # None if build failed
+        c_spin = _spin_until_ns      # None if build failed
+        c_nanosleep = _nanosleep_ns  # None if build failed
 
         cur_slack = -1  # track to avoid redundant prctl
 
@@ -371,17 +399,22 @@ class LatencyWorker(threading.Thread):
 
             if sp_ref[0]:
                 if c_spin is not None:
-                    # C spin-wait: releases the GIL
-                    c_spin(t0 + sleep_ns)
+                    # C spin-wait: t1 measured inside C (GIL-free)
+                    t1 = c_spin(t0 + sleep_ns)
                 else:
                     # Python fallback (holds GIL, slow GUI)
                     deadline = t0 + sleep_ns
                     while gettime(CLK) < deadline:
                         pass
+                    t1 = gettime(CLK)
             else:
-                slp(sleep_ns / 1e9)
+                if c_nanosleep is not None:
+                    # C nanosleep: t1 measured inside C (GIL-free)
+                    t1 = c_nanosleep(sleep_ns)
+                else:
+                    slp(sleep_ns / 1e9)
+                    t1 = gettime(CLK)
 
-            t1 = gettime(CLK)
             cpu1 = getcpu()
 
             lat = t1 - t0 - sleep_ns
