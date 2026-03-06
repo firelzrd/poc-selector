@@ -1,17 +1,17 @@
-From 005899a1451dc043933abb0579036ccf71e46f1d Mon Sep 17 00:00:00 2001
+From d9881d16e209a3649a4ff96c7ee956716ce4ebfd Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 6 Mar 2026 16:39:53 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v2.2.7
+Date: Fri, 6 Mar 2026 20:00:00 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v2.2.8
 
 ---
  include/linux/sched/topology.h |   33 +-
  init/Kconfig                   |   13 +
- kernel/sched/fair.c            |  144 +++-
+ kernel/sched/fair.c            |  144 ++-
  kernel/sched/idle.c            |   10 +
- kernel/sched/poc_selector.c    | 1444 ++++++++++++++++++++++++++++++++
+ kernel/sched/poc_selector.c    | 1532 ++++++++++++++++++++++++++++++++
  kernel/sched/sched.h           |   99 +++
  kernel/sched/topology.c        |  183 ++++
- 7 files changed, 1888 insertions(+), 38 deletions(-)
+ 7 files changed, 1976 insertions(+), 38 deletions(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
@@ -333,10 +333,10 @@ index c39b089d4f..3fffa1a43f 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..2edeef0fec
+index 0000000000..3a2982a139
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,1444 @@
+@@ -0,0 +1,1532 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -376,7 +376,7 @@ index 0000000000..2edeef0fec
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "2.2.7"
++#define SCHED_POC_SELECTOR_VERSION  "2.2.8"
 +
 +/**************************************************************
 + * Static keys:
@@ -515,7 +515,8 @@ index 0000000000..2edeef0fec
 +/**************************************************************
 + * Compatibility mode static keys:
 + *
-+ * Controlled exclusively by the sched_poc_compat preset sysctl.
++ * Each key can be toggled individually via its own sysctl, or
++ * set as a group via the sched_poc_compat preset sysctl.
 + * All default to FALSE — zero overhead when compat is off.
 + */
 +
@@ -1403,6 +1404,72 @@ index 0000000000..2edeef0fec
 +	return ret;
 +}
 +
++static int sched_poc_compat_level1_cpu_sysctl_handler(const struct ctl_table *table,
++					      int write, void *buffer,
++					      size_t *lenp, loff_t *ppos)
++{
++	unsigned int val = static_branch_unlikely(&sched_poc_compat_level1_cpu) ? 1 : 0;
++	struct ctl_table tmp = {
++		.data    = &val,
++		.maxlen  = sizeof(val),
++		.extra1  = SYSCTL_ZERO,
++		.extra2  = SYSCTL_ONE,
++	};
++	int ret = proc_douintvec_minmax(&tmp, write, buffer, lenp, ppos);
++
++	if (!ret && write) {
++		if (val)
++			static_branch_enable(&sched_poc_compat_level1_cpu);
++		else
++			static_branch_disable(&sched_poc_compat_level1_cpu);
++	}
++	return ret;
++}
++
++static int sched_poc_compat_no_cfs_gate_sysctl_handler(const struct ctl_table *table,
++					       int write, void *buffer,
++					       size_t *lenp, loff_t *ppos)
++{
++	unsigned int val = static_branch_unlikely(&sched_poc_compat_no_cfs_gate) ? 1 : 0;
++	struct ctl_table tmp = {
++		.data    = &val,
++		.maxlen  = sizeof(val),
++		.extra1  = SYSCTL_ZERO,
++		.extra2  = SYSCTL_ONE,
++	};
++	int ret = proc_douintvec_minmax(&tmp, write, buffer, lenp, ppos);
++
++	if (!ret && write) {
++		if (val)
++			static_branch_enable(&sched_poc_compat_no_cfs_gate);
++		else
++			static_branch_disable(&sched_poc_compat_no_cfs_gate);
++	}
++	return ret;
++}
++
++static int sched_poc_compat_cluster_ctz_sysctl_handler(const struct ctl_table *table,
++					       int write, void *buffer,
++					       size_t *lenp, loff_t *ppos)
++{
++	unsigned int val = static_branch_unlikely(&sched_poc_compat_cluster_ctz) ? 1 : 0;
++	struct ctl_table tmp = {
++		.data    = &val,
++		.maxlen  = sizeof(val),
++		.extra1  = SYSCTL_ZERO,
++		.extra2  = SYSCTL_ONE,
++	};
++	int ret = proc_douintvec_minmax(&tmp, write, buffer, lenp, ppos);
++
++	if (!ret && write) {
++		if (val)
++			static_branch_enable(&sched_poc_compat_cluster_ctz);
++		else
++			static_branch_disable(&sched_poc_compat_cluster_ctz);
++	}
++	return ret;
++}
++
 +static int sched_poc_compat_sysctl_handler(const struct ctl_table *table,
 +					   int write, void *buffer,
 +					   size_t *lenp, loff_t *ppos)
@@ -1495,6 +1562,27 @@ index 0000000000..2edeef0fec
 +		.maxlen		= sizeof(unsigned int),
 +		.mode		= 0644,
 +		.proc_handler	= sched_poc_count_sysctl_handler,
++	},
++	{
++		.procname	= "sched_poc_compat_level1_cpu",
++		.data		= NULL,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= sched_poc_compat_level1_cpu_sysctl_handler,
++	},
++	{
++		.procname	= "sched_poc_compat_no_cfs_gate",
++		.data		= NULL,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= sched_poc_compat_no_cfs_gate_sysctl_handler,
++	},
++	{
++		.procname	= "sched_poc_compat_cluster_ctz",
++		.data		= NULL,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= sched_poc_compat_cluster_ctz_sysctl_handler,
 +	},
 +	{
 +		.procname	= "sched_poc_compat",
