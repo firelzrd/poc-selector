@@ -1,7 +1,7 @@
-From ed437f99d28a77f8b0f34e00d77668d729ce80dc Mon Sep 17 00:00:00 2001
+From 266cff8338c86b47ed4bef663802cf71a1f2cc3d Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 14 Mar 2026 21:46:49 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v2.4.0
+Date: Sat, 14 Mar 2026 22:18:14 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v2.4.1
 
 ---
  include/linux/sched/topology.h |   33 +-
@@ -334,7 +334,7 @@ index c39b089d4f..3fffa1a43f 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..a3627974b7
+index 0000000000..d27b885855
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
 @@ -0,0 +1,1084 @@
@@ -377,7 +377,7 @@ index 0000000000..a3627974b7
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "2.4.0"
++#define SCHED_POC_SELECTOR_VERSION  "2.4.1"
 +
 +/**************************************************************
 + * Static keys:
@@ -425,9 +425,9 @@ index 0000000000..a3627974b7
 + * CPU exits do_idle().  The per-CPU RR counter still prevents
 + * same-CPU burst duplicates.
 + *
-+ * Default: disabled.
++ * Default: enabled.
 + */
-+DEFINE_STATIC_KEY_FALSE(sched_poc_early_clear);
++DEFINE_STATIC_KEY_TRUE(sched_poc_early_clear);
 +
 +/*
 + * SMT consecutive layout: sched_poc_smt_consecutive
@@ -847,7 +847,7 @@ index 0000000000..a3627974b7
 +static __always_inline void poc_commit_selection(int cpu,
 +	struct sched_domain_shared *sd_share)
 +{
-+	if (static_branch_unlikely(&sched_poc_early_clear)) {
++	if (static_branch_likely(&sched_poc_early_clear)) {
 +		int bit = cpu - sd_share->poc_cpu_base;
 +
 +		atomic64_andnot(1ULL << bit, &sd_share->poc_idle_cpus_mask);
@@ -1096,7 +1096,7 @@ index 0000000000..a3627974b7
 +					     int write, void *buffer,
 +					     size_t *lenp, loff_t *ppos)
 +{
-+	unsigned int val = static_branch_unlikely(&sched_poc_early_clear) ? 1 : 0;
++	unsigned int val = static_branch_likely(&sched_poc_early_clear) ? 1 : 0;
 +	struct ctl_table tmp = {
 +		.data    = &val,
 +		.maxlen  = sizeof(val),
