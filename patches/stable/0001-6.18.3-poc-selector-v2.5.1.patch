@@ -1,7 +1,7 @@
-From 5d190f2a1c6f0ad6909e4af9edb8c1b910748766 Mon Sep 17 00:00:00 2001
+From 4e804893f4c1a775af1cbade59e7f3268acf0510 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 2 Apr 2026 01:16:57 +0900
-Subject: [PATCH] 6.18.3-poc-selector-vv2.5.0r2
+Date: Thu, 2 Apr 2026 05:47:12 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v2.5.1
 
 ---
  include/linux/sched/topology.h |   50 +-
@@ -9,10 +9,10 @@ Subject: [PATCH] 6.18.3-poc-selector-vv2.5.0r2
  kernel/sched/ext.c             |    7 +
  kernel/sched/fair.c            |  166 +++-
  kernel/sched/idle.c            |   10 +
- kernel/sched/poc_selector.c    | 1671 ++++++++++++++++++++++++++++++++
+ kernel/sched/poc_selector.c    | 1676 ++++++++++++++++++++++++++++++++
  kernel/sched/sched.h           |  109 +++
  kernel/sched/topology.c        |  226 +++++
- 8 files changed, 2214 insertions(+), 38 deletions(-)
+ 8 files changed, 2219 insertions(+), 38 deletions(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
@@ -406,10 +406,10 @@ index c39b089d4f..3fffa1a43f 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..8869ddaa2c
+index 0000000000..c38b3ea4ad
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,1671 @@
+@@ -0,0 +1,1676 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -449,7 +449,7 @@ index 0000000000..8869ddaa2c
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "2.5.0"
++#define SCHED_POC_SELECTOR_VERSION  "2.5.1"
 +
 +/**************************************************************
 + * Static keys:
@@ -1211,8 +1211,13 @@ index 0000000000..8869ddaa2c
 +			cpu_rq(cpu)->nr_running <= 2) {
 +		int bit = cpu - sd_share->poc_cpu_base;
 +
-+		atomic64_andnot(1ULL << bit, &sd_share->poc_idle_cpus_mask);
-+		smp_mb__after_atomic();
++		if (static_branch_unlikely(&sched_poc_lockless_bitmap)) {
++			WRITE_ONCE(sd_share->poc_idle_cpus[bit], 0);
++			smp_wmb();
++		} else {
++			atomic64_andnot(1ULL << bit, &sd_share->poc_idle_cpus_mask);
++			smp_mb__after_atomic();
++		}
 +	}
 +}
 +
