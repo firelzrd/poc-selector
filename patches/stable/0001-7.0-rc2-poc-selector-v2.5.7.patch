@@ -1,18 +1,18 @@
-From d5f62f961da6c93af697df21c0e5069e2c19c166 Mon Sep 17 00:00:00 2001
+From 5e6f2331feabe9b07a7b585b7250609d17f00836 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 21 Apr 2026 18:01:36 +0900
-Subject: [PATCH] 7.0-rc2-poc-selector-v2.5.6
+Date: Wed, 22 Apr 2026 11:54:29 +0900
+Subject: [PATCH] 7.0-rc2-poc-selector-v2.5.7
 
 ---
  include/linux/sched/topology.h |   50 +-
  init/Kconfig                   |   13 +
  kernel/sched/ext.c             |    7 +
- kernel/sched/fair.c            |  166 +++-
+ kernel/sched/fair.c            |  163 ++-
  kernel/sched/idle.c            |   10 +
  kernel/sched/poc_selector.c    | 1693 ++++++++++++++++++++++++++++++++
- kernel/sched/sched.h           |  117 +++
+ kernel/sched/sched.h           |  116 +++
  kernel/sched/topology.c        |  226 +++++
- 8 files changed, 2244 insertions(+), 38 deletions(-)
+ 8 files changed, 2240 insertions(+), 38 deletions(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
@@ -126,7 +126,7 @@ index 06cc0a4aec..22bd954845 100644
  		sch->ops.name, scx_switched_all() ? "" : " (partial)");
  	kobject_uevent(&sch->kobj, KOBJ_ADD);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index bf948db905..a2723c26f7 100644
+index bf948db905..433b7b4421 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -1140,7 +1140,7 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -165,7 +165,7 @@ index bf948db905..a2723c26f7 100644
  
 +static inline bool is_idle_core(int cpu)
 +{
-+	return available_idle_cpu(cpu);
++	return (available_idle_cpu(cpu) || sched_idle_cpu(cpu));
 +}
 +
  static inline int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
@@ -350,24 +350,21 @@ index bf948db905..a2723c26f7 100644
  	/*
  	 * For cluster machines which have lower sharing cache like L2 or
  	 * LLC Tag, we tend to find an idle CPU in the target's cluster
-@@ -7961,6 +8045,16 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+@@ -7961,6 +8045,13 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
  	if ((unsigned int)recent_used_cpu < nr_cpumask_bits)
  		return recent_used_cpu;
  
 +#ifdef CONFIG_SCHED_POC_SELECTOR
 +	/* Last resort: avoid enqueuing behind RT/DL tasks on target */
-+	if (static_branch_likely(&poc_selector_active)) {
-+		if (!rt_task(cpu_rq(target)->curr))
-+			return target;
-+
-+		if (prev != target && !rt_task(cpu_rq(prev)->curr))
-+			return prev;
-+	}
++	if (static_branch_likely(&poc_selector_active) &&
++			rt_task(cpu_rq(target)->curr) &&
++			prev != target && !rt_task(cpu_rq(prev)->curr))
++		return prev;
 +#endif
  	return target;
  }
  
-@@ -8643,7 +8737,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+@@ -8643,7 +8734,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
  		new_cpu = sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
  	} else if (wake_flags & WF_TTWU) { /* XXX always ? */
  		/* Fast path */
@@ -406,7 +403,7 @@ index 3681b6ad92..320c560620 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..4f652f6cb4
+index 0000000000..4c3eb77c5b
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
 @@ -0,0 +1,1693 @@
@@ -449,7 +446,7 @@ index 0000000000..4f652f6cb4
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "2.5.6"
++#define SCHED_POC_SELECTOR_VERSION  "2.5.7"
 +
 +/**************************************************************
 + * Static keys:
@@ -2104,22 +2101,21 @@ index 0000000000..4f652f6cb4
 +#endif /* CONFIG_SYSFS */
 +#endif /* CONFIG_SCHED_POC_SELECTOR */
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 43bbf0693c..6248c78138 100644
+index 43bbf0693c..8758a230df 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -1163,6 +1163,11 @@ struct rq {
+@@ -1163,6 +1163,10 @@ struct rq {
  	call_single_data_t	nohz_csd;
  #endif /* CONFIG_NO_HZ_COMMON */
  
 +#ifdef CONFIG_SCHED_POC_SELECTOR
 +	unsigned int		poc_idle_committed;
 +#endif
-+	u64			nr_switches;
 +
  #ifdef CONFIG_UCLAMP_TASK
  	/* Utilization clamp values based on CPU's RUNNABLE tasks */
  	struct uclamp_rq	uclamp[UCLAMP_CNT] ____cacheline_aligned;
-@@ -2283,8 +2288,119 @@ static inline struct task_group *task_group(struct task_struct *p)
+@@ -2283,8 +2287,119 @@ static inline struct task_group *task_group(struct task_struct *p)
  
  #endif /* !CONFIG_CGROUP_SCHED */
  
@@ -2239,7 +2235,7 @@ index 43bbf0693c..6248c78138 100644
  	set_task_rq(p, cpu);
  #ifdef CONFIG_SMP
  	/*
-@@ -3365,6 +3481,7 @@ extern void nohz_run_idle_balance(int cpu);
+@@ -3365,6 +3480,7 @@ extern void nohz_run_idle_balance(int cpu);
  static inline void nohz_run_idle_balance(int cpu) { }
  #endif
  
