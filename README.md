@@ -508,10 +508,12 @@ sudo sysctl kernel.sched_poc_selector=1
 
 ## Special Thanks
 
-RitzDaCat - of course, for giving birth to scx_cake inspiring me of implementing the selector.  
-Andrea Righi, Mario Roy, and Eric Naim - for "sched/fair: Prefer the previous cpu for wakeup", whose select_idle_sibling() restructuring the POC fast path is built on top of (packaged in CachyOS as [`376f0e6`](https://github.com/CachyOS/linux/commit/376f0e652af46c) for 7.0 and [`a6aadc8`](https://github.com/CachyOS/linux/commit/a6aadc8d176685) for 7.1).  
-Mario Roy - for prev-cpu preference and recent_used_cpu hoisting in the above patch, for advising me about the PTSelect algorithm use, providing me lots of test suites and more.  
-The CachyOS Community Members - who patiently contributed with many useful feedbacks.
+- RitzDaCat - of course, for scx_cake's O(1) bitmap-driven idle CPU selection — the original spark that this entire project crystallizes around.  
+- Shubhang Kaushik - for "[sched/fair: Prefer cache-hot prev_cpu for wakeup](https://lore.kernel.org/all/20251017-b4-sched-cfs-refactor-propagate-v1-1-1eb0dc5b19b3@os.amperecomputing.com/)", whose pioneering prev_cpu-first wakeup heuristic reshaped how this work approaches the fast path.  
+- Tingjia Cao - for "[select_idle_sibling() doesn't consider sync wakeup logic](https://lore.kernel.org/all/CABcWv98gu6HqbOEoOPBL4tJrcGmU=1x3=fN3Fpho8wiY+D22CQ@mail.gmail.com/)", that also improved the prev_core wakeup heuristic.
+- Mario Roy - for "sched/fair: Prefer the previous cpu for wakeup" (the Original patch that I integrated) and the [prev-cpu preference and recent_used_cpu](https://gist.github.com/marioroy/dcac006c425cde5b6802bef041d952b8) tweak. Hoisting in the above patch, for the painstaking, hands-on work that connected the dots behind today's large gains, for advising me on the PTSelect algorithm use, and much more.  
+- Andrea Righi and Eric Naim - Supportive work around the inclusion to CachyOS ([`376f0e6`](https://github.com/CachyOS/linux/commit/376f0e652af46c) for 7.0 and [`a6aadc8`](https://github.com/CachyOS/linux/commit/a6aadc8d176685) for 7.1).  
+- The CachyOS Community Members - who patiently contributed with many useful feedbacks.
 
 ## License
 
