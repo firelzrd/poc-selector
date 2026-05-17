@@ -509,7 +509,8 @@ sudo sysctl kernel.sched_poc_selector=1
 ## Special Thanks
 
 RitzDaCat - of course, for giving birth to scx_cake inspiring me of implementing the selector.  
-Mario Roy - for advising me about the PTSelect algorithm use, providing me lots of test suites and more.  
+Andrea Righi, Mario Roy, and Eric Naim - for "sched/fair: Prefer the previous cpu for wakeup", whose select_idle_sibling() restructuring the POC fast path is built on top of (packaged in CachyOS as [`376f0e6`](https://github.com/CachyOS/linux/commit/376f0e652af46c) for 7.0 and [`a6aadc8`](https://github.com/CachyOS/linux/commit/a6aadc8d176685) for 7.1).  
+Mario Roy - for prev-cpu preference and recent_used_cpu hoisting in the above patch, for advising me about the PTSelect algorithm use, providing me lots of test suites and more.  
 The CachyOS Community Members - who patiently contributed with many useful feedbacks.
 
 ## License
