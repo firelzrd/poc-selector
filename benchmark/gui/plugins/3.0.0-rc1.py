@@ -1,14 +1,14 @@
-"""POC Selector 2.6.1 plugin — target_sticky + smt_fallback + early_select + greedy_search + lockless_bitmap + rr_improved toggles."""
+"""POC Selector 3.0.0-rc1 plugin — waker_yield + target_sticky + smt_fallback + early_select + greedy_search + rr_improved toggles."""
 
 from PyQt5.QtWidgets import QCheckBox, QHBoxLayout
 import os
 
+SYSCTL_WAKER_YIELD      = "/proc/sys/kernel/sched_poc_waker_yield"
 SYSCTL_TARGET_STICKY    = "/proc/sys/kernel/sched_poc_target_sticky"
 SYSCTL_SMT_FALLBACK     = "/proc/sys/kernel/sched_poc_smt_fallback"
 SYSCTL_RR_IMPROVED      = "/proc/sys/kernel/sched_poc_rr_improved"
 SYSCTL_EARLY_SELECT     = "/proc/sys/kernel/sched_poc_early_select"
 SYSCTL_GREEDY_SEARCH    = "/proc/sys/kernel/sched_poc_greedy_search"
-SYSCTL_LOCKLESS_BITMAP  = "/proc/sys/kernel/sched_poc_lockless_bitmap"
 
 
 def _sysctl_read(path):
@@ -46,10 +46,20 @@ def _make_toggle(layout, label, tooltip, sysctl_path, writable):
 
 def setup(layout):
     """Called by MainWindow to populate plugin controls row."""
-    writable = os.access(SYSCTL_TARGET_STICKY, os.W_OK)
+    writable = os.access(SYSCTL_WAKER_YIELD, os.W_OK)
 
     row = QHBoxLayout()
     row.setContentsMargins(0, 0, 0, 0)
+
+    _make_toggle(row, "Waker yield (L1w)",
+        "sched_poc_waker_yield: when the waker is the only runnable "
+        "task on its CPU (nr_running <= 1) and its SMT siblings are "
+        "free (or the wake is sync), place the wakee on the waker's "
+        "own CPU: zero follow-on migration, warm L1/L2/TLB. Fires for "
+        "any ttwu (pipe/fork/signal), no WF_SYNC flag needed. "
+        "Default: ON",
+        SYSCTL_WAKER_YIELD, writable)
+    row.addSpacing(15)
 
     _make_toggle(row, "Early select",
         "sched_poc_early_select: check recent_used_cpu and target for "
@@ -63,13 +73,6 @@ def setup(layout):
         "is false (default: OFF)",
         SYSCTL_SMT_FALLBACK, writable)
     row.addSpacing(15)
-
-    _make_toggle(row, "Lockless bitmap",
-        "sched_poc_lockless_bitmap: use u8[64] flag array with plain "
-        "WRITE_ONCE (no LOCK prefix) for idle state tracking. "
-        "ON=lockless flag array, OFF=atomic64 bitmap with LOCK'd "
-        "writes (default). Toggle for A/B benchmarking.",
-        SYSCTL_LOCKLESS_BITMAP, writable)
 
     _make_toggle(row, "Target sticky",
         "sched_poc_target_sticky: if target CPU is idle, return it "
