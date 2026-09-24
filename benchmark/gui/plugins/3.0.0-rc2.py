@@ -1,4 +1,4 @@
-"""POC Selector 3.0.0-rc1 plugin — waker_yield + target_sticky + smt_fallback + early_select + greedy_search + rr_improved toggles."""
+"""POC Selector 3.0.0-rc2 plugin — waker_yield + target_sticky + smt_fallback + early_select + greedy_search + rr_improved toggles."""
 
 from PyQt5.QtWidgets import QCheckBox, QHBoxLayout
 import os
